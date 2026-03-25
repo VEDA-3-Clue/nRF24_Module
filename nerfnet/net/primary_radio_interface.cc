@@ -16,6 +16,7 @@
 
 #include "nerfnet/net/primary_radio_interface.h"
 
+#include <algorithm>
 #include <vector>
 
 #include "nerfnet/util/log.h"
@@ -60,6 +61,39 @@ PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
 
 void PrimaryRadioInterface::Run() {
   while (true) {
+    const uint64_t now_us = TimeNowUs();
+
+    if (disconnected_) {
+      if (now_us < next_retry_time_us_) {
+        SleepUs(1000);  // 1ms 정도로 짧게 자면서 대기
+        continue;
+      }
+
+      if (!ConnectionReset()) {
+        ++reset_fail_log_counter_;
+        if ((reset_fail_log_counter_ % 100) == 1) {
+          LOGE("[COORD] connection reset failed (count=%llu, backoff_us=%llu)",
+               static_cast<unsigned long long>(reset_fail_log_counter_),
+               static_cast<unsigned long long>(disconnect_backoff_us_));
+        }
+
+        next_retry_time_us_ = TimeNowUs() + disconnect_backoff_us_;
+        disconnect_backoff_us_ *= 2;
+        if (disconnect_backoff_us_ > kMaxDisconnectBackoffUs) {
+          disconnect_backoff_us_ = kMaxDisconnectBackoffUs;
+        }
+      } else {
+        LOGI("[COORD] connection reset success");
+        disconnected_ = false;
+        connection_reset_required_ = false;
+        poll_fail_count_ = 0;
+        disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
+        next_retry_time_us_ = 0;
+        state_ = CoordinatorState::Idle;
+      }
+      continue;
+    }
+
     if (state_ == CoordinatorState::Idle && !peer_has_pending_) {
       current_poll_interval_us_ = kIdlePollIntervalUs;
     } else {
@@ -70,47 +104,63 @@ void PrimaryRadioInterface::Run() {
 
     if (connection_reset_required_) {
       if (!ConnectionReset()) {
-        LOGE("[COORD] connection reset failed");
+        ++reset_fail_log_counter_;
+        if ((reset_fail_log_counter_ % 100) == 1) {
+          LOGE("[COORD] connection reset failed (count=%llu)",
+               static_cast<unsigned long long>(reset_fail_log_counter_));
+        }
         HandleTransactionFailure();
       } else {
         LOGI("[COORD] connection reset success");
         connection_reset_required_ = false;
         state_ = CoordinatorState::Idle;
         poll_fail_count_ = 0;
+        disconnected_ = false;
+        disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
+        next_retry_time_us_ = 0;
       }
       continue;
     }
 
     if (PerformExchange()) {
       poll_fail_count_ = 0;
+      disconnected_ = false;
+      disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
+      next_retry_time_us_ = 0;
     } else {
       HandleTransactionFailure();
     }
 
-    const uint64_t now_us = TimeNowUs();
+    const uint64_t stat_now_us = TimeNowUs();
     if (last_stat_print_us_ == 0) {
-      last_stat_print_us_ = now_us;
+      last_stat_print_us_ = stat_now_us;
     }
 
-    if (now_us - last_stat_print_us_ >= 1000000) {
+    if (stat_now_us - last_stat_print_us_ >= 1000000) {
       LOGI("[COORD][STAT] pend_tx=%llu grant_tx=%llu data_tx=%llu "
-          "ack_rx=%llu pend_rx=%llu data_rx=%llu "
-          "send_fail=%llu rx_timeout=%llu",
-          static_cast<unsigned long long>(tx_pending_count_),
-          static_cast<unsigned long long>(tx_grant_count_),
-          static_cast<unsigned long long>(tx_data_count_),
-          static_cast<unsigned long long>(rx_ack_count_),
-          static_cast<unsigned long long>(rx_pending_count_),
-          static_cast<unsigned long long>(rx_data_count_),
-          static_cast<unsigned long long>(tx_send_fail_count_),
-          static_cast<unsigned long long>(rx_timeout_count_));
+           "ack_rx=%llu pend_rx=%llu data_rx=%llu "
+           "send_fail=%llu rx_timeout=%llu disconnected=%u fail_streak=%d backoff_us=%llu",
+           static_cast<unsigned long long>(tx_pending_count_),
+           static_cast<unsigned long long>(tx_grant_count_),
+           static_cast<unsigned long long>(tx_data_count_),
+           static_cast<unsigned long long>(rx_ack_count_),
+           static_cast<unsigned long long>(rx_pending_count_),
+           static_cast<unsigned long long>(rx_data_count_),
+           static_cast<unsigned long long>(tx_send_fail_count_),
+           static_cast<unsigned long long>(rx_timeout_count_),
+           disconnected_ ? 1u : 0u,
+           poll_fail_count_,
+           static_cast<unsigned long long>(disconnect_backoff_us_));
 
-      last_stat_print_us_ = now_us;
+      last_stat_print_us_ = stat_now_us;
     }
   }
 }
 
 bool PrimaryRadioInterface::ConnectionReset() {
+  radio_.flush_rx();
+  radio_.flush_tx();
+
   {
     std::lock_guard<std::mutex> lock(read_buffer_mutex_);
     next_tx_seq_ = 1;
@@ -154,7 +204,13 @@ bool PrimaryRadioInterface::ConnectionReset() {
     return false;
   }
 
-  return rx.type == FrameType::Reset;
+  if (rx.type != FrameType::Reset) {
+    return false;
+  }
+
+  radio_.flush_rx();
+  radio_.flush_tx();
+  return true;
 }
 
 bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
@@ -273,7 +329,10 @@ bool PrimaryRadioInterface::PerformExchange() {
   auto result = Send(request);
   if (result != RequestResult::Success) {
     ++tx_send_fail_count_;
-    LOGE("[COORD] send failed");
+    ++fail_log_counter_;
+    if ((fail_log_counter_ % 100) == 1) {
+      LOGE("[COORD] send failed");
+    }
     return false;
   }
 
@@ -281,7 +340,10 @@ bool PrimaryRadioInterface::PerformExchange() {
   result = Receive(response, /*timeout_us=*/100000);
   if (result != RequestResult::Success) {
     ++rx_timeout_count_;
-    LOGE("[COORD] receive failed");
+    ++fail_log_counter_;
+    if ((fail_log_counter_ % 100) == 1) {
+      LOGE("[COORD] receive failed");
+    }
     return false;
   }
 
@@ -317,14 +379,18 @@ bool PrimaryRadioInterface::PerformExchange() {
 
 void PrimaryRadioInterface::HandleTransactionFailure() {
   ++poll_fail_count_;
-  if (poll_fail_count_ > 10) {
+
+  if (poll_fail_count_ >= kDisconnectFailureThreshold) {
+    disconnected_ = true;
     connection_reset_required_ = true;
     state_ = CoordinatorState::ResetSync;
-  } else {
-    current_poll_interval_us_ *= 2;
-    if (current_poll_interval_us_ > 1000000) {
-      current_poll_interval_us_ = 1000000;
-    }
+    next_retry_time_us_ = TimeNowUs() + disconnect_backoff_us_;
+    return;
+  }
+
+  current_poll_interval_us_ *= 2;
+  if (current_poll_interval_us_ > 1000000) {
+    current_poll_interval_us_ = 1000000;
   }
 }
 

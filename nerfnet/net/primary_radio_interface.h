@@ -17,6 +17,7 @@
 #ifndef NERFNET_NET_PRIMARY_RADIO_INTERFACE_H_
 #define NERFNET_NET_PRIMARY_RADIO_INTERFACE_H_
 
+#include <algorithm>
 #include <cstdint>
 
 #include "nerfnet/net/radio_interface.h"
@@ -24,7 +25,7 @@
 namespace nerfnet {
 
 class PrimaryRadioInterface : public RadioInterface {
- public:
+public:
   PrimaryRadioInterface(uint16_t ce_pin,
                         int tunnel_fd,
                         uint32_t primary_addr,
@@ -46,6 +47,11 @@ private:
   static constexpr uint64_t kIdlePollIntervalUs = 20000;
   static constexpr uint64_t kActivePollIntervalUs = 1000;
 
+  static constexpr int kDisconnectFailureThreshold = 3;
+  static constexpr uint64_t kInitialDisconnectBackoffUs = 100000;   // 100 ms
+  static constexpr uint64_t kMaxDisconnectBackoffUs = 1000000;      // 1 s
+  static constexpr uint64_t kDisconnectedSleepSliceUs = 1000;       // 1 ms
+
   uint8_t peer_grant_budget_;
 
   uint64_t tx_pending_count_ = 0;
@@ -61,6 +67,11 @@ private:
   uint64_t current_poll_interval_us_;
   int poll_fail_count_;
 
+  bool disconnected_ = false;
+  uint64_t disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
+  uint64_t next_retry_time_us_ = 0;
+  uint64_t reset_fail_log_counter_ = 0;
+
   CoordinatorState state_;
   bool connection_reset_required_;
 
@@ -69,6 +80,7 @@ private:
 
   uint64_t idle_log_counter_ = 0;
   uint64_t stat_loop_counter_ = 0;
+  uint64_t fail_log_counter_ = 0;
   uint64_t last_stat_print_us_ = 0;
 
   bool ConnectionReset();
