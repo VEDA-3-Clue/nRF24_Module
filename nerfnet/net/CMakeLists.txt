@@ -26,3 +26,5 @@ target_link_libraries(nerfnet PUBLIC
   rf24
   util
 )
+
+install(TARGETS nerfnet DESTINATION bin)

@@ -2,3 +2,7 @@
 *.swn
 *.swo
 build
+
+**/build
+**/build-aarch64
+**/install_pack

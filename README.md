@@ -136,3 +136,23 @@ best to avoid that by selecting different channels.
 Maybe don't use this for anything too important, or do ;)
 
 Enjoy!
+
+
+## Docker 를 사용하여 개발환경 구축 하기
+
+1. image 만들기<br/>
+    app-dev 이미지가 없다면 아래 명령을 통해 도커 이미지를 구축할 수 있습니다.<br/>
+    이미 이미지를 생성 되어있다면 중복해서 생성하실 필요가 없습니다.<br/>
+    `docker build -t app-dev -f tools/Docker-env/docker-app/Dockerfile .`
+
+## container 만들기<br/>
+    컨테이너는 아래 명령을 통해 바로 작업 폴더에 마운트를하여 사용할 수 있습니다.<br/>
+    `docker run --rm -it --name rf-dev-container -v "${PWD}:/workspace" -w /workspace app-dev bash`
+
+
+## 프로젝트 빌드 방법
+
+`cmake --preset aarch64-release`
+`cmake --build --preset aarch64-release`
+`cmake --install /workspace/build-aarch64`
+`cpack --preset aarch64-release`

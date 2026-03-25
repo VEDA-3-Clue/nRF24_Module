@@ -1,0 +1,26 @@
+#!/bin/sh
+set -eu
+
+DIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+BIN_DIR="$DIR/bin"
+LIB_DIR="$DIR/lib"
+LOADER="/lib/ld-linux-aarch64.so.1"
+
+cd "$DIR"
+if [ ! -d "$LIB_DIR" ]; then
+    echo "error: missing runtime library directory: $LIB_DIR" >&2
+    exit 1
+fi
+
+if [ ! -x "$BIN_DIR/nerfnet" ]; then
+    echo "error: missing executable: $BIN_DIR/nerfnet" >&2
+    exit 1
+fi
+
+if [ -x "$LOADER" ]; then
+    # Use the target loader directly so bundled libs under ./lib are preferred.
+    exec "$LOADER" --library-path "$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" "$BIN_DIR/nerfnet" "$@"
+fi
+
+export LD_LIBRARY_PATH="$LIB_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$BIN_DIR/nerfnet" "$@"

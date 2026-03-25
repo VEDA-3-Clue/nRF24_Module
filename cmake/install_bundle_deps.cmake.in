@@ -1,0 +1,76 @@
+# Bundle non-system shared library dependencies under ./lib for target deployment.
+set(_install_root "$ENV{DESTDIR}${CMAKE_INSTALL_PREFIX}")
+set(_bin "${_install_root}/bin/nerfnet")
+if(NOT EXISTS "${_bin}")
+    message(WARNING "[bundle] nerfnet not found at install step: ${_bin}")
+    return()
+endif()
+
+set(_sysroot "@CMAKE_SYSROOT@")
+set(_search_dirs)
+if(NOT _sysroot STREQUAL "")
+    list(APPEND _search_dirs
+        "${_sysroot}/usr/lib/aarch64-linux-gnu"
+        "${_sysroot}/lib/aarch64-linux-gnu"
+        "${_sysroot}/usr/lib"
+        "${_sysroot}/lib"
+    )
+endif()
+
+file(GET_RUNTIME_DEPENDENCIES
+    EXECUTABLES "${_bin}"
+    RESOLVED_DEPENDENCIES_VAR _resolved_deps
+    UNRESOLVED_DEPENDENCIES_VAR _unresolved_deps
+    CONFLICTING_DEPENDENCIES_PREFIX _conflicting_deps
+    DIRECTORIES ${_search_dirs}
+    POST_EXCLUDE_REGEXES
+        ".*/ld-linux[^/]*\\.so(\\.[0-9]+)*$"
+        ".*/libc\\.so(\\.[0-9]+)*$"
+        ".*/libm\\.so(\\.[0-9]+)*$"
+        ".*/libstdc\\+\\+\\.so(\\.[0-9]+)*$"
+        ".*/libgcc_s\\.so(\\.[0-9]+)*$"
+        ".*/libpthread\\.so(\\.[0-9]+)*$"
+        ".*/librt\\.so(\\.[0-9]+)*$"
+        ".*/libdl\\.so(\\.[0-9]+)*$"
+)
+
+if(DEFINED _conflicting_deps_FILENAMES)
+    foreach(_soname IN LISTS _conflicting_deps_FILENAMES)
+        set(_candidates "${_conflicting_deps_${_soname}}")
+        set(_selected "")
+        foreach(_candidate IN LISTS _candidates)
+            if(NOT _sysroot STREQUAL "")
+                string(FIND "${_candidate}" "${_sysroot}/" _is_from_sysroot)
+                if(_is_from_sysroot EQUAL 0)
+                    set(_selected "${_candidate}")
+                    break()
+                endif()
+            endif()
+        endforeach()
+
+        if(_selected STREQUAL "")
+            list(GET _candidates 0 _selected)
+        endif()
+
+        message(WARNING "[bundle] conflicting dependency ${_soname}; selected ${_selected}")
+        list(APPEND _resolved_deps "${_selected}")
+    endforeach()
+endif()
+
+if(_unresolved_deps)
+    message(WARNING "[bundle] unresolved runtime deps: ${_unresolved_deps}")
+endif()
+
+if(_resolved_deps)
+    list(REMOVE_DUPLICATES _resolved_deps)
+    file(MAKE_DIRECTORY "${_install_root}/lib")
+    foreach(_dep IN LISTS _resolved_deps)
+        file(INSTALL
+            DESTINATION "${_install_root}/lib"
+            TYPE SHARED_LIBRARY
+            FOLLOW_SYMLINK_CHAIN
+            FILES "${_dep}"
+        )
+    endforeach()
+    message(STATUS "[bundle] copied runtime deps to ${_install_root}/lib")
+endif()
