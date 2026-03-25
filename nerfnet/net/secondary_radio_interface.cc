@@ -27,7 +27,8 @@ SecondaryRadioInterface::SecondaryRadioInterface(uint16_t ce_pin,
                                                  uint32_t primary_addr,
                                                  uint32_t secondary_addr,
                                                  uint8_t channel)
-    : RadioInterface(ce_pin, tunnel_fd, primary_addr, secondary_addr, channel) {
+    : RadioInterface(ce_pin, tunnel_fd, primary_addr, secondary_addr, channel),
+      granted_to_send_(false) {
   uint8_t writing_addr[5] = {
       static_cast<uint8_t>(secondary_addr),
       static_cast<uint8_t>(secondary_addr >> 8),
@@ -42,6 +43,7 @@ SecondaryRadioInterface::SecondaryRadioInterface(uint16_t ce_pin,
       static_cast<uint8_t>(primary_addr >> 24),
       0,
   };
+
   radio_.openWritingPipe(writing_addr);
   radio_.openReadingPipe(kPipeId, reading_addr);
 }
@@ -59,28 +61,37 @@ void SecondaryRadioInterface::Run() {
       continue;
     }
 
+    LogPeerRx(rx);
+
     if (rx.type == FrameType::Reset) {
       if (!HandleReset()) {
-        LOGE("Failed to handle RESET");
+        LOGE("[PEER] reset handling failed");
       }
       continue;
     }
 
-    MacFrame tx;
-    if (!HandleCoordinatorFrame(rx, tx)) {
-      LOGE("Failed to handle coordinator frame");
+    if (!ApplyCoordinatorRequest(rx)) {
+      LOGE("[PEER] failed to apply coordinator request");
       continue;
     }
 
+    MacFrame tx;
+    if (!ChoosePeerResponse(tx)) {
+      LOGE("[PEER] failed to choose response");
+      continue;
+    }
+
+    LogPeerTx(tx);
+
     std::vector<uint8_t> response;
     if (!EncodeMacFrame(tx, response)) {
-      LOGE("Failed to encode peer response");
+      LOGE("[PEER] encode failed");
       continue;
     }
 
     result = Send(response);
     if (result != RequestResult::Success) {
-      LOGE("Failed to send peer response");
+      LOGE("[PEER] send failed");
     }
   }
 }
@@ -97,82 +108,106 @@ bool SecondaryRadioInterface::HandleReset() {
     frame_buffer_.clear();
   }
 
-  MacFrame reset;
-  reset.type = FrameType::Reset;
+  granted_to_send_ = false;
+
+  MacFrame tx;
+  tx.type = FrameType::Reset;
+  tx.seq = 0;
+  tx.ack = 0;
+  tx.pending = 0;
+  tx.arg = 0;
 
   std::vector<uint8_t> response;
-  if (!EncodeMacFrame(reset, response)) {
+  if (!EncodeMacFrame(tx, response)) {
     return false;
   }
 
   return Send(response) == RequestResult::Success;
 }
 
-bool SecondaryRadioInterface::HandleCoordinatorFrame(const MacFrame& request,
-                                                     MacFrame& response) {
+bool SecondaryRadioInterface::ApplyCoordinatorRequest(const MacFrame& request) {
   std::lock_guard<std::mutex> lock(read_buffer_mutex_);
 
-  // 1) First apply ACK carried by coordinator frame.
   CommitAckLocked(request.ack);
 
-  // 2) Then consume incoming DATA if present.
-  if (request.type == FrameType::Data) {
-    if (!ConsumeDataFrameLocked(request)) {
-      return false;
-    }
-  }
-
-  // 3) Build response according to coordinator instruction.
-  response = {};
-  response.ack = last_rx_seq_.value_or(kNoSeq);
-  response.pending = PendingHintLocked();
-
   switch (request.type) {
-    case FrameType::Grant:
-      if ((tx_in_flight_ || !read_buffer_.empty()) && request.arg > 0) {
-        if (!BuildNextDataFrameLocked(response)) {
-          return false;
-        }
-      } else {
-        response.type = FrameType::Ack;
+    case FrameType::Data:
+      if (!ConsumeDataFrameLocked(request)) {
+        return false;
       }
+      granted_to_send_ = false;
       return true;
 
-    case FrameType::Data:
-      // Coordinator sent DATA. Peer does not send DATA back immediately
-      // unless it has explicit grant, so advertise pending only.
-      if (tx_in_flight_ || !read_buffer_.empty()) {
-        response.type = FrameType::Pending;
-      } else {
-        response.type = FrameType::Ack;
-      }
+    case FrameType::Grant:
+      granted_to_send_ = (request.arg > 0);
       return true;
 
     case FrameType::Pending:
-      // Coordinator has no immediate DATA for us; advertise our queue.
-      if (tx_in_flight_ || !read_buffer_.empty()) {
-        response.type = FrameType::Pending;
-      } else {
-        response.type = FrameType::Ack;
-      }
+      granted_to_send_ = false;
       return true;
 
     case FrameType::Ack:
-      // Not normally expected as coordinator request, but tolerate it.
-      if (tx_in_flight_ || !read_buffer_.empty()) {
-        response.type = FrameType::Pending;
-      } else {
-        response.type = FrameType::Ack;
-      }
+      granted_to_send_ = false;
       return true;
-
-    case FrameType::Reset:
-      // handled by caller
-      return false;
 
     default:
       return false;
   }
+}
+
+bool SecondaryRadioInterface::ChoosePeerResponse(MacFrame& tx) {
+  tx = {};
+  tx.ack = last_rx_seq_.value_or(kNoSeq);
+
+  bool local_has_data = false;
+  {
+    std::lock_guard<std::mutex> lock(read_buffer_mutex_);
+    local_has_data = tx_in_flight_ || !read_buffer_.empty();
+  }
+
+  tx.pending = local_has_data ? 1 : 0;
+
+  if (granted_to_send_ && local_has_data) {
+    std::lock_guard<std::mutex> lock(read_buffer_mutex_);
+    if (!BuildNextDataFrameLocked(tx)) {
+      return false;
+    }
+    tx.pending = 1;
+    granted_to_send_ = false;
+    return true;
+  }
+
+  if (local_has_data) {
+    tx.type = FrameType::Pending;
+    tx.seq = 0;
+    tx.arg = 0;
+    return true;
+  }
+
+  tx.type = FrameType::Ack;
+  tx.seq = 0;
+  tx.arg = 0;
+  return true;
+}
+
+void SecondaryRadioInterface::LogPeerRx(const MacFrame& rx) {
+  LOGI("[PEER][RX] type=%u seq=%u ack=%u pending=%u arg=%u payload=%zu",
+       static_cast<unsigned>(rx.type),
+       rx.seq,
+       rx.ack,
+       rx.pending,
+       rx.arg,
+       rx.payload.size());
+}
+
+void SecondaryRadioInterface::LogPeerTx(const MacFrame& tx) {
+  LOGI("[PEER][TX] type=%u seq=%u ack=%u pending=%u arg=%u payload=%zu",
+       static_cast<unsigned>(tx.type),
+       tx.seq,
+       tx.ack,
+       tx.pending,
+       tx.arg,
+       tx.payload.size());
 }
 
 }  // namespace nerfnet

@@ -21,7 +21,6 @@
 
 namespace nerfnet {
 
-// Peer-side responder.
 class SecondaryRadioInterface : public RadioInterface {
  public:
   SecondaryRadioInterface(uint16_t ce_pin,
@@ -33,10 +32,16 @@ class SecondaryRadioInterface : public RadioInterface {
   void Run();
 
  private:
+  bool granted_to_send_;
+
   bool HandleReset();
-  bool HandleCoordinatorFrame(const MacFrame& request, MacFrame& response);
+  bool ApplyCoordinatorRequest(const MacFrame& request);
+  bool ChoosePeerResponse(MacFrame& response);
+
+  void LogPeerRx(const MacFrame& rx);
+  void LogPeerTx(const MacFrame& tx);
 };
 
 }  // namespace nerfnet
 
-#endif  // NERFNET_NET_SECONDARY_RADIO_INTERFACE_H_
+#endif

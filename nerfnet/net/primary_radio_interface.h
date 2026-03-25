@@ -23,8 +23,6 @@
 
 namespace nerfnet {
 
-// Coordinator-side scheduler.
-// File name stays the same to minimize build churn.
 class PrimaryRadioInterface : public RadioInterface {
  public:
   PrimaryRadioInterface(uint16_t ce_pin,
@@ -37,21 +35,35 @@ class PrimaryRadioInterface : public RadioInterface {
   void Run();
 
  private:
-  static constexpr uint8_t kDefaultBurstGrant = 4;
+  enum class CoordinatorState {
+    ResetSync,
+    Idle,
+    IssueGrant,
+  };
+
+  static constexpr uint8_t kDefaultBurstGrant = 1;
 
   const uint64_t poll_interval_us_;
-  int poll_fail_count_ = 0;
   uint64_t current_poll_interval_us_;
+  int poll_fail_count_;
+
+  CoordinatorState state_;
   bool connection_reset_required_;
 
-  uint8_t peer_pending_hint_ = 0;
-  uint8_t peer_grant_remaining_ = 0;
+  bool peer_has_pending_;
+  bool last_tx_was_data_;
 
   bool ConnectionReset();
   bool PerformExchange();
   void HandleTransactionFailure();
+
+  bool ChooseCoordinatorTxFrame(MacFrame& tx);
+  bool ApplyPeerResponse(const MacFrame& rx);
+
+  void LogCoordinatorTx(const MacFrame& tx);
+  void LogCoordinatorRx(const MacFrame& rx);
 };
 
 }  // namespace nerfnet
 
-#endif  // NERFNET_NET_PRIMARY_RADIO_INTERFACE_H_
+#endif
