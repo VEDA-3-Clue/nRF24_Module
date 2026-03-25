@@ -77,7 +77,7 @@ RadioInterface::RequestResult RadioInterface::Send(
   }
 
   while (!radio_.txStandBy()) {
-    // Existing code busy-waits here.
+    SleepUs(50);
   }
   return RequestResult::Success;
 }
@@ -93,6 +93,7 @@ RadioInterface::RequestResult RadioInterface::Receive(
       LOGE("Timeout receiving response");
       return RequestResult::Timeout;
     }
+    SleepUs(50);
   }
 
   radio_.read(response.data(), response.size());

@@ -43,7 +43,7 @@ private:
   };
 
   static constexpr uint8_t kDefaultBurstGrant = 3;
-  static constexpr uint64_t kIdlePollIntervalUs = 10000;
+  static constexpr uint64_t kIdlePollIntervalUs = 20000;
   static constexpr uint64_t kActivePollIntervalUs = 1000;
 
   uint8_t peer_grant_budget_;

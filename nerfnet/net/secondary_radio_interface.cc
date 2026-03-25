@@ -61,8 +61,6 @@ void SecondaryRadioInterface::Run() {
       continue;
     }
 
-    LogPeerRx(rx);
-
     if (rx.type == FrameType::Reset) {
       if (!HandleReset()) {
         LOGE("[PEER] reset handling failed");
@@ -81,8 +79,6 @@ void SecondaryRadioInterface::Run() {
       continue;
     }
 
-    LogPeerTx(tx);
-
     std::vector<uint8_t> response;
     if (!EncodeMacFrame(tx, response)) {
       LOGE("[PEER] encode failed");
@@ -92,6 +88,14 @@ void SecondaryRadioInterface::Run() {
     result = Send(response);
     if (result != RequestResult::Success) {
       LOGE("[PEER] send failed");
+    }
+
+    bool is_idle_pair =
+    (rx.type == FrameType::Pending && tx.type == FrameType::Ack);
+
+    if (!is_idle_pair || (idle_log_counter_++ % 100 == 0)) {
+      LogPeerRx(rx);
+      LogPeerTx(tx);
     }
   }
 }

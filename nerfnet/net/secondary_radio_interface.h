@@ -34,6 +34,7 @@ class SecondaryRadioInterface : public RadioInterface {
  private:
   uint8_t grant_budget_;
   bool granted_to_send_;
+  uint64_t idle_log_counter_ = 0;
 
   bool HandleReset();
   bool ApplyCoordinatorRequest(const MacFrame& request);
