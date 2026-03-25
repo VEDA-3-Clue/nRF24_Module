@@ -28,7 +28,7 @@ SecondaryRadioInterface::SecondaryRadioInterface(uint16_t ce_pin,
                                                  uint32_t secondary_addr,
                                                  uint8_t channel)
     : RadioInterface(ce_pin, tunnel_fd, primary_addr, secondary_addr, channel),
-      granted_to_send_(false) {
+      granted_to_send_(false), grant_budget_(0) {
   uint8_t writing_addr[5] = {
       static_cast<uint8_t>(secondary_addr),
       static_cast<uint8_t>(secondary_addr >> 8),
@@ -109,6 +109,7 @@ bool SecondaryRadioInterface::HandleReset() {
   }
 
   granted_to_send_ = false;
+  grant_budget_ = 0;
 
   MacFrame tx;
   tx.type = FrameType::Reset;
@@ -136,18 +137,22 @@ bool SecondaryRadioInterface::ApplyCoordinatorRequest(const MacFrame& request) {
         return false;
       }
       granted_to_send_ = false;
+      grant_budget_ = 0;
       return true;
 
     case FrameType::Grant:
-      granted_to_send_ = (request.arg > 0);
+      grant_budget_ = request.arg;
+      granted_to_send_ = (grant_budget_ > 0);
       return true;
 
     case FrameType::Pending:
       granted_to_send_ = false;
+      grant_budget_ = 0;
       return true;
 
     case FrameType::Ack:
       granted_to_send_ = false;
+      grant_budget_ = 0;
       return true;
 
     default:
@@ -167,13 +172,16 @@ bool SecondaryRadioInterface::ChoosePeerResponse(MacFrame& tx) {
 
   tx.pending = local_has_data ? 1 : 0;
 
-  if (granted_to_send_ && local_has_data) {
+  if (granted_to_send_ && grant_budget_ > 0 && local_has_data) {
     std::lock_guard<std::mutex> lock(read_buffer_mutex_);
     if (!BuildNextDataFrameLocked(tx)) {
       return false;
     }
     tx.pending = 1;
-    granted_to_send_ = false;
+    --grant_budget_;
+    if (grant_budget_ == 0) {
+      granted_to_send_ = false;
+    }
     return true;
   }
 

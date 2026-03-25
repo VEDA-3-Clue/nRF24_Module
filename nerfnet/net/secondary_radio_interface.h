@@ -32,6 +32,7 @@ class SecondaryRadioInterface : public RadioInterface {
   void Run();
 
  private:
+  uint8_t grant_budget_;
   bool granted_to_send_;
 
   bool HandleReset();

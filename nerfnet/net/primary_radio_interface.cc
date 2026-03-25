@@ -36,7 +36,9 @@ PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
       state_(CoordinatorState::ResetSync),
       connection_reset_required_(true),
       peer_has_pending_(false),
-      last_tx_was_data_(false) {
+      last_tx_was_data_(false),
+      peer_grant_budget_(0),
+      last_stat_print_us_ (0) {
   uint8_t writing_addr[5] = {
       static_cast<uint8_t>(primary_addr),
       static_cast<uint8_t>(primary_addr >> 8),
@@ -58,6 +60,12 @@ PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
 
 void PrimaryRadioInterface::Run() {
   while (true) {
+    if (state_ == CoordinatorState::Idle && !peer_has_pending_) {
+      current_poll_interval_us_ = kIdlePollIntervalUs;
+    } else {
+      current_poll_interval_us_ = kActivePollIntervalUs;
+    }
+
     SleepUs(current_poll_interval_us_);
 
     if (connection_reset_required_) {
@@ -69,16 +77,35 @@ void PrimaryRadioInterface::Run() {
         connection_reset_required_ = false;
         state_ = CoordinatorState::Idle;
         poll_fail_count_ = 0;
-        current_poll_interval_us_ = poll_interval_us_;
       }
       continue;
     }
 
     if (PerformExchange()) {
       poll_fail_count_ = 0;
-      current_poll_interval_us_ = poll_interval_us_;
     } else {
       HandleTransactionFailure();
+    }
+
+    const uint64_t now_us = TimeNowUs();
+    if (last_stat_print_us_ == 0) {
+      last_stat_print_us_ = now_us;
+    }
+
+    if (now_us - last_stat_print_us_ >= 1000000) {
+      LOGI("[COORD][STAT] pend_tx=%llu grant_tx=%llu data_tx=%llu "
+          "ack_rx=%llu pend_rx=%llu data_rx=%llu "
+          "send_fail=%llu rx_timeout=%llu",
+          static_cast<unsigned long long>(tx_pending_count_),
+          static_cast<unsigned long long>(tx_grant_count_),
+          static_cast<unsigned long long>(tx_data_count_),
+          static_cast<unsigned long long>(rx_ack_count_),
+          static_cast<unsigned long long>(rx_pending_count_),
+          static_cast<unsigned long long>(rx_data_count_),
+          static_cast<unsigned long long>(tx_send_fail_count_),
+          static_cast<unsigned long long>(rx_timeout_count_));
+
+      last_stat_print_us_ = now_us;
     }
   }
 }
@@ -96,6 +123,7 @@ bool PrimaryRadioInterface::ConnectionReset() {
   }
 
   peer_has_pending_ = false;
+  peer_grant_budget_ = 0;
   last_tx_was_data_ = false;
 
   MacFrame tx;
@@ -148,10 +176,12 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
       return true;
 
     case CoordinatorState::IssueGrant:
+    case CoordinatorState::ActiveRx:
       tx.type = FrameType::Grant;
       tx.pending = local_has_data ? 1 : 0;
       tx.arg = kDefaultBurstGrant;
       last_tx_was_data_ = false;
+      ++tx_grant_count_;
       return true;
 
     case CoordinatorState::Idle:
@@ -162,6 +192,7 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
         }
         tx.pending = 1;
         last_tx_was_data_ = true;
+        ++tx_data_count_;
         return true;
       }
 
@@ -169,6 +200,7 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
       tx.pending = 0;
       tx.arg = 0;
       last_tx_was_data_ = false;
+      ++tx_pending_count_;
       return true;
   }
 
@@ -192,17 +224,26 @@ bool PrimaryRadioInterface::ApplyPeerResponse(const MacFrame& rx) {
 
   switch (rx.type) {
     case FrameType::Ack:
-      state_ = peer_has_pending_ ? CoordinatorState::IssueGrant
-                                 : CoordinatorState::Idle;
+      ++rx_ack_count_;
+      if (peer_has_pending_) {
+        state_ = CoordinatorState::IssueGrant;
+      } else {
+        state_ = CoordinatorState::Idle;
+      }
       return true;
 
     case FrameType::Pending:
+      ++rx_pending_count_;
       state_ = CoordinatorState::IssueGrant;
       return true;
 
     case FrameType::Data:
-      state_ = peer_has_pending_ ? CoordinatorState::IssueGrant
-                                 : CoordinatorState::Idle;
+      ++rx_data_count_;
+      if (peer_has_pending_) {
+        state_ = CoordinatorState::ActiveRx;
+      } else {
+        state_ = CoordinatorState::Idle;
+      }
       return true;
 
     case FrameType::Reset:
@@ -224,8 +265,6 @@ bool PrimaryRadioInterface::PerformExchange() {
     return false;
   }
 
-  LogCoordinatorTx(tx);
-
   std::vector<uint8_t> request;
   if (!EncodeMacFrame(tx, request)) {
     return false;
@@ -233,6 +272,7 @@ bool PrimaryRadioInterface::PerformExchange() {
 
   auto result = Send(request);
   if (result != RequestResult::Success) {
+    ++tx_send_fail_count_;
     LOGE("[COORD] send failed");
     return false;
   }
@@ -240,6 +280,7 @@ bool PrimaryRadioInterface::PerformExchange() {
   std::vector<uint8_t> response(kMaxPacketSize, 0x00);
   result = Receive(response, /*timeout_us=*/100000);
   if (result != RequestResult::Success) {
+    ++rx_timeout_count_;
     LOGE("[COORD] receive failed");
     return false;
   }
@@ -250,7 +291,26 @@ bool PrimaryRadioInterface::PerformExchange() {
     return false;
   }
 
-  LogCoordinatorRx(rx);
+  bool is_idle_pair =
+    (tx.type == FrameType::Pending && rx.type == FrameType::Ack);
+
+  if (!is_idle_pair || (idle_log_counter_++ % 100 == 0)) {
+    LOGI("[COORD][PAIR] TX(type=%u seq=%u ack=%u pending=%u arg=%u payload=%zu) "
+        "RX(type=%u seq=%u ack=%u pending=%u arg=%u payload=%zu) state=%d",
+        static_cast<unsigned>(tx.type),
+        tx.seq,
+        tx.ack,
+        tx.pending,
+        tx.arg,
+        tx.payload.size(),
+        static_cast<unsigned>(rx.type),
+        rx.seq,
+        rx.ack,
+        rx.pending,
+        rx.arg,
+        rx.payload.size(),
+        static_cast<int>(state_));
+  }
 
   return ApplyPeerResponse(rx);
 }
@@ -266,27 +326,6 @@ void PrimaryRadioInterface::HandleTransactionFailure() {
       current_poll_interval_us_ = 1000000;
     }
   }
-}
-
-void PrimaryRadioInterface::LogCoordinatorTx(const MacFrame& tx) {
-  LOGI("[COORD][TX] type=%u seq=%u ack=%u pending=%u arg=%u payload=%zu state=%d",
-       static_cast<unsigned>(tx.type),
-       tx.seq,
-       tx.ack,
-       tx.pending,
-       tx.arg,
-       tx.payload.size(),
-       static_cast<int>(state_));
-}
-
-void PrimaryRadioInterface::LogCoordinatorRx(const MacFrame& rx) {
-  LOGI("[COORD][RX] type=%u seq=%u ack=%u pending=%u arg=%u payload=%zu",
-       static_cast<unsigned>(rx.type),
-       rx.seq,
-       rx.ack,
-       rx.pending,
-       rx.arg,
-       rx.payload.size());
 }
 
 }  // namespace nerfnet

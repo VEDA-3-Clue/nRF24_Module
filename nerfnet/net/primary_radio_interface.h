@@ -34,14 +34,28 @@ class PrimaryRadioInterface : public RadioInterface {
 
   void Run();
 
- private:
+private:
   enum class CoordinatorState {
     ResetSync,
     Idle,
     IssueGrant,
+    ActiveRx,
   };
 
-  static constexpr uint8_t kDefaultBurstGrant = 1;
+  static constexpr uint8_t kDefaultBurstGrant = 3;
+  static constexpr uint64_t kIdlePollIntervalUs = 10000;
+  static constexpr uint64_t kActivePollIntervalUs = 1000;
+
+  uint8_t peer_grant_budget_;
+
+  uint64_t tx_pending_count_ = 0;
+  uint64_t tx_grant_count_ = 0;
+  uint64_t tx_data_count_ = 0;
+  uint64_t rx_ack_count_ = 0;
+  uint64_t rx_pending_count_ = 0;
+  uint64_t rx_data_count_ = 0;
+  uint64_t tx_send_fail_count_ = 0;
+  uint64_t rx_timeout_count_ = 0;
 
   const uint64_t poll_interval_us_;
   uint64_t current_poll_interval_us_;
@@ -53,15 +67,16 @@ class PrimaryRadioInterface : public RadioInterface {
   bool peer_has_pending_;
   bool last_tx_was_data_;
 
+  uint64_t idle_log_counter_ = 0;
+  uint64_t stat_loop_counter_ = 0;
+  uint64_t last_stat_print_us_ = 0;
+
   bool ConnectionReset();
   bool PerformExchange();
   void HandleTransactionFailure();
 
   bool ChooseCoordinatorTxFrame(MacFrame& tx);
   bool ApplyPeerResponse(const MacFrame& rx);
-
-  void LogCoordinatorTx(const MacFrame& tx);
-  void LogCoordinatorRx(const MacFrame& rx);
 };
 
 }  // namespace nerfnet
