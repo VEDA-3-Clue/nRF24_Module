@@ -17,11 +17,13 @@
 #ifndef NERFNET_NET_RADIO_INTERFACE_H_
 #define NERFNET_NET_RADIO_INTERFACE_H_
 
+#include <RF24/RF24.h>
+#include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <deque>
 #include <mutex>
 #include <optional>
-#include <RF24/RF24.h>
 #include <thread>
 #include <vector>
 
@@ -29,115 +31,104 @@
 
 namespace nerfnet {
 
-// The interface to send/receive data using an RF24 radio.
+// Common MAC/radio interface used by both coordinator and peer.
 class RadioInterface : public NonCopyable {
  public:
-  // Setup the radio interface.
-  RadioInterface(uint16_t ce_pin, int tunnel_fd,
-                 uint32_t primary_addr, uint32_t secondary_addr,
+  RadioInterface(uint16_t ce_pin,
+                 int tunnel_fd,
+                 uint32_t primary_addr,
+                 uint32_t secondary_addr,
                  uint8_t channel);
-  ~RadioInterface();
+  virtual ~RadioInterface();
 
-  // The possible results of a request operation.
   enum class RequestResult {
-    // The request was successful.
     Success,
-
-    // The request timed out.
     Timeout,
-
-    // The request could not be sent because it was malformed.
     Malformed,
-
-    // There was an error transmitting the request.
     TransmitError,
+  };
+
+  enum class FrameType : uint8_t {
+    Invalid = 0,
+    Pending = 1,  // "I have queued data"
+    Grant   = 2,  // "You may send N DATA frames"
+    Data    = 3,  // One RF fragment
+    Ack     = 4,  // Pure ACK, no payload
+    Reset   = 5,  // Link/session reset
+  };
+
+  struct MacFrame {
+    FrameType type = FrameType::Invalid;
+    uint8_t seq = 0;      // valid only for DATA
+    uint8_t ack = 0;      // cumulative ACK for peer DATA
+    uint8_t pending = 0;  // number of queued local frames/fragments hint
+    uint8_t arg = 0;      // GRANT: credits, DATA: bytes_left
+    std::vector<uint8_t> payload;
   };
 
   void SetTunnelLogsEnabled(bool enabled) { tunnel_logs_enabled_ = enabled; }
 
  protected:
-  // The number of microseconds to poll over.
   static constexpr uint32_t kPollIntervalUs = 1000;
-
-  // The maximum size of a packet.
   static constexpr size_t kMaxPacketSize = 32;
-  static constexpr size_t kMaxPayloadSize = kMaxPacketSize - 2;
-
-  // The default pipe to use for sending data.
+  static constexpr size_t kHeaderSize = 5;
+  static constexpr size_t kMaxPayloadSize = kMaxPacketSize - kHeaderSize;
   static constexpr uint8_t kPipeId = 1;
 
-  // The mask for IDs.
-  static constexpr uint8_t kIDMask = 0x0f;
+  static constexpr uint8_t kNoSeq = 0;
+  static constexpr uint8_t kMaxSeq = 31;
 
-  // A tunnel Tx/Rx request exchanged between systems.
-  struct TunnelTxRxPacket {
-    std::optional<uint8_t> id;
-    std::optional<uint8_t> ack_id;
-
-    uint8_t bytes_left = 0;
-    std::vector<uint8_t> payload;
-  };
-
-  // The underlying radio.
   RF24 radio_;
-
-  // The file descriptor for the network tunnel.
   const int tunnel_fd_;
-
-  // The addresses to use for this radio pair.
   const uint32_t primary_addr_;
   const uint32_t secondary_addr_;
 
-  // The thread to read from the tunnel interface on.
   std::thread tunnel_thread_;
   std::atomic<bool> running_;
 
-  // The buffer of data read and lock.
   std::mutex read_buffer_mutex_;
   std::deque<std::vector<uint8_t>> read_buffer_;
-
-  // The frame buffer for the currently incoming frame. Written out to
-  // the tunnel interface when completely received.
   std::vector<uint8_t> frame_buffer_;
 
-  // The next ID for packet ID generation.
-  uint8_t next_id_;
+  // TX state
+  uint8_t next_tx_seq_;
+  bool tx_in_flight_;
+  uint8_t tx_inflight_seq_;
+  uint8_t tx_inflight_bytes_left_;
+  std::vector<uint8_t> tx_inflight_payload_;
 
-  // The last ID that needs to be acknowledged.
-  std::optional<uint8_t> last_ack_id_;
+  // RX ACK state
+  std::optional<uint8_t> last_rx_seq_;
 
-  // Whether to log successful tunnel read/write operations.
   bool tunnel_logs_enabled_;
 
-  // Sends a message over the radio.
   RequestResult Send(const std::vector<uint8_t>& request);
+  RequestResult Receive(std::vector<uint8_t>& response, uint64_t timeout_us = 0);
 
-  // Reads a message from the radio.
-  RequestResult Receive(std::vector<uint8_t>& response,
-                        uint64_t timeout_us = 0);
-
-  // Returns the size of the read buffer.
+  // Raw queue helpers.
   size_t GetReadBufferSize();
-
-  // Returns the size of the next payload to send.
   size_t GetTransferSize(const std::vector<uint8_t>& frame);
+  uint8_t PendingHintLocked() const;
 
-  // Advances the packet ID counter.
-  void AdvanceID();
+  // Sequence helpers.
+  void AdvanceTxSeq();
+  bool IsExpectedRxSeq(uint8_t seq) const;
 
-  // Returns true if the supplied ID is the next ID.
-  bool ValidateID(uint8_t id);
-
-  // Reads from the tunnel and buffers data read.
+  // Thread that reads from TUN and buffers complete IP frames.
   void TunnelThread();
 
-  // Encode/decode functions for TunnelTxRxPackets.
-  bool DecodeTunnelTxRxPacket(const std::vector<uint8_t>& request,
-      TunnelTxRxPacket& tunnel);
-  bool EncodeTunnelTxRxPacket(const TunnelTxRxPacket& tunnel,
-      std::vector<uint8_t>& request);
+  // Frame codec.
+  bool EncodeMacFrame(const MacFrame& frame, std::vector<uint8_t>& packet);
+  bool DecodeMacFrame(const std::vector<uint8_t>& packet, MacFrame& frame);
 
-  // Writes the current frame buffer to the tunnel.
+  // TX fragment helpers. Caller must hold read_buffer_mutex_.
+  bool BuildNextDataFrameLocked(MacFrame& frame);
+  void CommitAckLocked(uint8_t ack_seq);
+
+  // RX DATA handling. Caller must hold read_buffer_mutex_.
+  bool ConsumeDataFrameLocked(const MacFrame& frame);
+
+  // Flush current reassembled IP frame to TUN.
   void WriteTunnel();
 };
 

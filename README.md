@@ -1,142 +1,71 @@
-# nerfnet
+# nRF24_Module
 
-An application that allows using nRF24L01 radios to establish a wireless network
-between Raspberry Pi computers.
+nRF24L01 기반의 저대역폭 무선 링크 위에 TUN 인터페이스를 올려  
+IP 패킷을 전송하는 실험용 네트워크 모듈입니다.
 
-## design
+이 프로젝트는 Raspberry Pi + nRF24L01 조합을 사용하여  
+간단한 point-to-point IP 링크를 구성하는 것을 목표로 합니다.
 
-This application uses virtual network devices to create tunnels on each system
-that runs `nerfnet`. The radios are run in either primary or secondary mode. It
-doesn't matter which radio is primary and which is secondary. This merely
-determines which system initiates the request to exchange network packets.
+기존 구현은 `Primary / Secondary` 기반의 polling 구조였으나,  
+현재 버전은 이를 확장하여 다음과 같은 **Coordinator + Peer + PENDING/GRANT/DATA/ACK**  
+프레임 체계를 사용합니다.
 
-This makes the design polled from the primary radio to the secondary radio.
+즉, 제어 역할은 Coordinator가 담당하되,  
+데이터 전송은 기존의 단순 polling보다 더 효율적인 **burst 기반 교환 구조**로 동작합니다.
 
-## building
+---
 
-This project uses the cmake build system and tclap for command-line arguments.
-The following packages must be installed:
+## 1. 주요 특징
 
+- nRF24L01 기반 무선 링크
+- Raspberry Pi TUN 인터페이스 기반 IP 통신
+- 단일 RF 링크 위에 IP packet forwarding
+- 기존 polling 병목을 줄이기 위한 MAC frame 기반 프로토콜
+- `PENDING / GRANT / DATA / ACK / RESET` 프레임 지원
+- burst 기반 fragment 전송
+- TUN을 통한 `ping`, `iperf`, `UDP`, `RTP` 등 실험 가능
+
+---
+
+## 2. 시스템 개요
+
+프로젝트는 두 개의 노드로 구성됩니다.
+
+- **Coordinator**
+- **Peer**
+
+논리적으로는 Coordinator가 세션 및 교환 흐름을 주도하지만,  
+데이터 자체는 어느 쪽에서든 큐에 쌓일 수 있으며,  
+Peer 역시 `PENDING`을 통해 자신에게 전송할 데이터가 있음을 광고할 수 있습니다.
+
+### 기존 구조와 차이점
+
+기존 구조:
+- Primary가 Secondary를 지속적으로 poll
+- Secondary는 요청이 올 때까지 대기
+- 빈 poll이 많고 uplink 지연이 큼
+
+현재 구조:
+- Coordinator가 기본 keepalive/poll을 수행
+- Peer는 `PENDING`으로 대기 중인 데이터 존재를 광고
+- Coordinator는 `GRANT`를 통해 burst 전송 기회를 부여
+- 실제 데이터는 `DATA` 프레임으로 연속 전송
+- `ACK`는 누적 ACK(cumulative ACK) 방식으로 처리
+
+---
+
+## 3. 전체 아키텍처
+
+```text
++-------------------+                       +-------------------+
+|   Coordinator     | <---- nRF24L01 ----> |       Peer        |
+|-------------------|                       |-------------------|
+| TUN interface     |                       | TUN interface     |
+| MAC scheduler     |                       | MAC responder     |
+| Pending/Grant     |                       | Pending advertise |
+| Fragment TX/RX    |                       | Fragment TX/RX    |
++-------------------+                       +-------------------+
 ```
-sudo apt-get install git cmake build-essential \
-    libtclap-dev
-```
-
-Once the required packages are installed, the standard cmake workflow is used:
-
-```
-git clone git@github.com:aarossig/nerfnet.git
-cd nerfnet
-mkdir build
-cd build
-cmake ..
-make -j4
-```
-
-Watch for any errors after running cmake to check for mising packages.
-
-## usage
-
-As mentioned above, `nerfnet` relies on polling from a primary radio to a
-secondary radio. Here are example invocations for the primary and secondary
-radios to establish the network link.
-
-### primary
-
-```
-sudo nerfnet --primary
-```
-
-### secondary
-
-```
-sudo nerfnet --secondary
-```
-
-### flags
-
-There are a number of flags to configure the radios. They can all be obtained
-by passing `--help`.
-
-#### ip address
-
-`nerfnet` will automatically assign `192.168.10.1` to the primary radio and
-`192.168.10.2` to the secondary radio. This can be overridden with the
-`--tunnel_address` and `--tunnel_mask` options. Examples:
-
-```
-sudo nerfnet --primary --tunnel_address 192.168.100.1
-```
-
-```
-sudo nerfnet --secondary --tunnel_address 10.0.0.1 --tunnel_mask 255.0.0.0
-```
-
-#### channel
-
-The NRF24L01 radios have 128 channels to choose from (0 to 127). It may be
-helpful to adjust the channel if a segment of the 2.4GHz band is congested.
-These radios default to channel 1.
-
-```
-sudo nerfnet --primary --channel 10
-```
-
-#### poll interval (primary only)
-
-The primary radio polls the secondary radio to simplify the interaction
-between nodes. The secondary is always queuing packets and waits for the
-primary radio to request them. The poll interval defaults to 100 microeconds.
-In order to save CPU time and reduce traffic on the air, this can be adjusted.
-
-```
-sudo nerfnet --primary --poll_interval_us 1000
-```
-
-The longer the interval, the higher the latency and throughput of the link.
-This may be desirable for certain applications, so this is left configurable.
-
-## testing
-
-Once the link is established, any standard networking tools can be used to
-characterize the link. Here is an example of using `iperf`.
-
-```
-# On the primary Raspberry Pi.
-iperf -s
-# On the secondary Raspberry Pi.
-iperf -c 192.168.10.1
-```
-
-This will evaluate the link performance.
-
-Any other network applications can be used over this link such as `ssh` or
-otherwise.
-
-## trivia
-
-This README was written using an SSH connection that was established over a
-`nerfnet` wireless link.
-
-This protocol is vulnerable to pretty much every attack known to exist. Here
-are the vulnerabilities that I can think of.
-
-1) No validation of nodes (lack of signing).
-2) No encryption.
-3) Subject to replay/timing attacks.
-
-The nice thing about widespread odoption of TLS these days is that these
-vulnerabilities become less critical. Unencrypted traffic is vulnerable
-to eavesdropping and manipulation.
-
-It is also possible that if two users of `nerfnet` reside on the same channel
-that their packets will cause loads of errors for each other. It would be
-best to avoid that by selecting different channels.
-
-Maybe don't use this for anything too important, or do ;)
-
-Enjoy!
-
 
 ## Docker 를 사용하여 개발환경 구축 하기
 
@@ -154,5 +83,4 @@ Enjoy!
 
 `cmake --preset aarch64-release`
 `cmake --build --preset aarch64-release`
-`cmake --install /workspace/build-aarch64`
 `cpack --preset aarch64-release`

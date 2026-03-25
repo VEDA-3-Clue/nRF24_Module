@@ -16,140 +16,162 @@
 
 #include "nerfnet/net/secondary_radio_interface.h"
 
-#include <unistd.h>
 #include <vector>
 
 #include "nerfnet/util/log.h"
-#include "nerfnet/util/time.h"
 
 namespace nerfnet {
 
-SecondaryRadioInterface::SecondaryRadioInterface(
-    uint16_t ce_pin, int tunnel_fd,
-    uint32_t primary_addr, uint32_t secondary_addr, uint8_t channel)
-    : RadioInterface(ce_pin, tunnel_fd, primary_addr, secondary_addr, channel),
-      payload_in_flight_(false) {
+SecondaryRadioInterface::SecondaryRadioInterface(uint16_t ce_pin,
+                                                 int tunnel_fd,
+                                                 uint32_t primary_addr,
+                                                 uint32_t secondary_addr,
+                                                 uint8_t channel)
+    : RadioInterface(ce_pin, tunnel_fd, primary_addr, secondary_addr, channel) {
   uint8_t writing_addr[5] = {
-    static_cast<uint8_t>(secondary_addr),
-    static_cast<uint8_t>(secondary_addr >> 8),
-    static_cast<uint8_t>(secondary_addr >> 16),
-    static_cast<uint8_t>(secondary_addr >> 24),
-    0,
+      static_cast<uint8_t>(secondary_addr),
+      static_cast<uint8_t>(secondary_addr >> 8),
+      static_cast<uint8_t>(secondary_addr >> 16),
+      static_cast<uint8_t>(secondary_addr >> 24),
+      0,
   };
-
   uint8_t reading_addr[5] = {
-    static_cast<uint8_t>(primary_addr),
-    static_cast<uint8_t>(primary_addr >> 8),
-    static_cast<uint8_t>(primary_addr >> 16),
-    static_cast<uint8_t>(primary_addr >> 24),
-    0,
+      static_cast<uint8_t>(primary_addr),
+      static_cast<uint8_t>(primary_addr >> 8),
+      static_cast<uint8_t>(primary_addr >> 16),
+      static_cast<uint8_t>(primary_addr >> 24),
+      0,
   };
-
   radio_.openWritingPipe(writing_addr);
   radio_.openReadingPipe(kPipeId, reading_addr);
 }
 
 void SecondaryRadioInterface::Run() {
-  uint8_t packet[kMaxPacketSize];
-
-  while (1) {
+  while (true) {
     std::vector<uint8_t> request(kMaxPacketSize, 0x00);
     auto result = Receive(request);
-    if (result == RequestResult::Success) {
-      HandleRequest(request);
+    if (result != RequestResult::Success) {
+      continue;
     }
-  }
-}
 
-void SecondaryRadioInterface::HandleRequest(
-    const std::vector<uint8_t>& request) {
-  if (request.size() != kMaxPacketSize) {
-    LOGE("Received short packet");
-  } else if (request[0] == 0x00) {
-    HandleNetworkTunnelReset();
-  } else {
-    HandleNetworkTunnelTxRx(request);
-  }
-}
-
-void SecondaryRadioInterface::HandleNetworkTunnelReset() {
-  next_id_ = 1;
-  last_ack_id_.reset();
-  frame_buffer_.clear();
-  payload_in_flight_ = false;
-
-  LOGI("Responding to tunnel reset request");
-  std::vector<uint8_t> response(kMaxPacketSize, 0x00);
-  auto status = Send(response);
-  if (status != RequestResult::Success) {
-    LOGE("Failed to send tunnel reset response");
-  }
-}
-
-void SecondaryRadioInterface::HandleNetworkTunnelTxRx(
-    const std::vector<uint8_t>& request) {
-  TunnelTxRxPacket tunnel;
-  if (!DecodeTunnelTxRxPacket(request, tunnel)) {
-    return;
-  }
-
-  std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-  if (!tunnel.id.has_value()
-      || (last_ack_id_.has_value() && !tunnel.ack_id.has_value())) {
-    LOGE("Missing tunnel fields");
-    return;
-  }
-
-  if (!ValidateID(tunnel.id.value())) {
-    LOGE("Received non-sequential packet: %u vs %u",
-        last_ack_id_.value(), tunnel.id.value());
-  } else if (!tunnel.payload.empty()) {
-    frame_buffer_.insert(frame_buffer_.end(),
-        tunnel.payload.begin(), tunnel.payload.end());
-    if (tunnel.bytes_left <= kMaxPayloadSize) {
-      WriteTunnel();
+    MacFrame rx;
+    if (!DecodeMacFrame(request, rx)) {
+      continue;
     }
-  }
 
-  if (tunnel.ack_id.has_value()) {
-    if (tunnel.ack_id.value() != next_id_) {
-      LOGE("Primary radio failed to ack, retransmitting");
-    } else {
-      AdvanceID();
-      if (payload_in_flight_) {
-        if (!read_buffer_.empty()) {
-          auto& frame = read_buffer_.front();
-          size_t transfer_size = GetTransferSize(frame);
-          frame.erase(frame.begin(), frame.begin() + transfer_size);
-          if (frame.empty()) {
-            read_buffer_.pop_front();
-          }
-        }
-
-        payload_in_flight_ = false;
+    if (rx.type == FrameType::Reset) {
+      if (!HandleReset()) {
+        LOGE("Failed to handle RESET");
       }
+      continue;
+    }
+
+    MacFrame tx;
+    if (!HandleCoordinatorFrame(rx, tx)) {
+      LOGE("Failed to handle coordinator frame");
+      continue;
+    }
+
+    std::vector<uint8_t> response;
+    if (!EncodeMacFrame(tx, response)) {
+      LOGE("Failed to encode peer response");
+      continue;
+    }
+
+    result = Send(response);
+    if (result != RequestResult::Success) {
+      LOGE("Failed to send peer response");
     }
   }
+}
 
-  tunnel.id = next_id_;
-  tunnel.ack_id = last_ack_id_.value();
-  tunnel.bytes_left = 0;
-  if (!read_buffer_.empty()) {
-    auto& frame = read_buffer_.front();
-    size_t transfer_size = GetTransferSize(frame);
-    tunnel.payload = {frame.begin(), frame.begin() + transfer_size};
-    tunnel.bytes_left = std::min(frame.size(), static_cast<size_t>(UINT8_MAX));
-    payload_in_flight_ = true;
+bool SecondaryRadioInterface::HandleReset() {
+  {
+    std::lock_guard<std::mutex> lock(read_buffer_mutex_);
+    next_tx_seq_ = 1;
+    tx_in_flight_ = false;
+    tx_inflight_seq_ = 0;
+    tx_inflight_bytes_left_ = 0;
+    tx_inflight_payload_.clear();
+    last_rx_seq_.reset();
+    frame_buffer_.clear();
   }
+
+  MacFrame reset;
+  reset.type = FrameType::Reset;
 
   std::vector<uint8_t> response;
-  if (!EncodeTunnelTxRxPacket(tunnel, response)) {
-    return;
+  if (!EncodeMacFrame(reset, response)) {
+    return false;
   }
 
-  auto status = Send(response);
-  if (status != RequestResult::Success) {
-    LOGE("Failed to send network tunnel txrx response");
+  return Send(response) == RequestResult::Success;
+}
+
+bool SecondaryRadioInterface::HandleCoordinatorFrame(const MacFrame& request,
+                                                     MacFrame& response) {
+  std::lock_guard<std::mutex> lock(read_buffer_mutex_);
+
+  // 1) First apply ACK carried by coordinator frame.
+  CommitAckLocked(request.ack);
+
+  // 2) Then consume incoming DATA if present.
+  if (request.type == FrameType::Data) {
+    if (!ConsumeDataFrameLocked(request)) {
+      return false;
+    }
+  }
+
+  // 3) Build response according to coordinator instruction.
+  response = {};
+  response.ack = last_rx_seq_.value_or(kNoSeq);
+  response.pending = PendingHintLocked();
+
+  switch (request.type) {
+    case FrameType::Grant:
+      if ((tx_in_flight_ || !read_buffer_.empty()) && request.arg > 0) {
+        if (!BuildNextDataFrameLocked(response)) {
+          return false;
+        }
+      } else {
+        response.type = FrameType::Ack;
+      }
+      return true;
+
+    case FrameType::Data:
+      // Coordinator sent DATA. Peer does not send DATA back immediately
+      // unless it has explicit grant, so advertise pending only.
+      if (tx_in_flight_ || !read_buffer_.empty()) {
+        response.type = FrameType::Pending;
+      } else {
+        response.type = FrameType::Ack;
+      }
+      return true;
+
+    case FrameType::Pending:
+      // Coordinator has no immediate DATA for us; advertise our queue.
+      if (tx_in_flight_ || !read_buffer_.empty()) {
+        response.type = FrameType::Pending;
+      } else {
+        response.type = FrameType::Ack;
+      }
+      return true;
+
+    case FrameType::Ack:
+      // Not normally expected as coordinator request, but tolerate it.
+      if (tx_in_flight_ || !read_buffer_.empty()) {
+        response.type = FrameType::Pending;
+      } else {
+        response.type = FrameType::Ack;
+      }
+      return true;
+
+    case FrameType::Reset:
+      // handled by caller
+      return false;
+
+    default:
+      return false;
   }
 }
 

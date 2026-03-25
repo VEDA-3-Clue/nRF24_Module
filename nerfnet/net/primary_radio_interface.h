@@ -17,41 +17,39 @@
 #ifndef NERFNET_NET_PRIMARY_RADIO_INTERFACE_H_
 #define NERFNET_NET_PRIMARY_RADIO_INTERFACE_H_
 
-#include <optional>
+#include <cstdint>
 
 #include "nerfnet/net/radio_interface.h"
 
 namespace nerfnet {
 
-// The primary mode radio interface.
+// Coordinator-side scheduler.
+// File name stays the same to minimize build churn.
 class PrimaryRadioInterface : public RadioInterface {
  public:
-  // Setup the primary radio link.
-  PrimaryRadioInterface(uint16_t ce_pin, int tunnel_fd,
-                        uint32_t primary_addr, uint32_t secondary_addr,
-                        uint8_t channel, uint64_t poll_interval_us);
+  PrimaryRadioInterface(uint16_t ce_pin,
+                        int tunnel_fd,
+                        uint32_t primary_addr,
+                        uint32_t secondary_addr,
+                        uint8_t channel,
+                        uint64_t poll_interval_us);
 
-  // Runs the interface.
   void Run();
 
  private:
-  // The interval between poll operations to the secondary radio.
-  const uint64_t poll_interval_us_;
+  static constexpr uint8_t kDefaultBurstGrant = 4;
 
-  // Logic for poll backoff when the secondary radio is not responding.
-  int poll_fail_count_;
+  const uint64_t poll_interval_us_;
+  int poll_fail_count_ = 0;
   uint64_t current_poll_interval_us_;
   bool connection_reset_required_;
 
-  // Requests that a new connection be opened.
+  uint8_t peer_pending_hint_ = 0;
+  uint8_t peer_grant_remaining_ = 0;
+
   bool ConnectionReset();
-
-  // Sends and receives messages to exchange network packets.
-  bool PerformTunnelTransfer();
-
-  // Updates the backoff configuration in the light of a failure.
+  bool PerformExchange();
   void HandleTransactionFailure();
-
 };
 
 }  // namespace nerfnet
