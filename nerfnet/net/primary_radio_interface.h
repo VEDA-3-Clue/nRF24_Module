@@ -32,7 +32,8 @@ public:
                         uint32_t secondary_addr,
                         uint8_t channel,
                         uint64_t poll_interval_us,
-                        const RadioConfig& radio_config);
+                        const RadioConfig& radio_config,
+                        int irq_pin = -1);
 
   void Run();
 
@@ -53,6 +54,7 @@ private:
   static constexpr uint8_t kDefaultBurstGrant = 3;
   static constexpr uint64_t kIdlePollIntervalUs = 20000;
   static constexpr uint64_t kActivePollIntervalUs = 1000;
+  static constexpr uint64_t kPostDataExchangeGapUs = 250;
 
   static constexpr int kDisconnectFailureThreshold = 5;
   static constexpr uint64_t kInitialDisconnectBackoffUs = 100000;   // 100 ms

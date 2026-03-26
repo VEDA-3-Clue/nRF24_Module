@@ -28,7 +28,8 @@ class SecondaryRadioInterface : public RadioInterface {
                           uint32_t primary_addr,
                           uint32_t secondary_addr,
                           uint8_t channel,
-                          const RadioConfig& radio_config);
+                          const RadioConfig& radio_config,
+                          int irq_pin = -1);
 
   void Run();
 

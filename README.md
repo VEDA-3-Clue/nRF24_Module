@@ -113,6 +113,44 @@ Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
   --channel 1
 ```
 
+### run.sh 실행 예시
+
+패키징 후에는 아래처럼 `run.sh` 를 사용하는 편이 편합니다.
+기본 RF 설정으로 실험할 때는 `--rf_*` 옵션을 주지 않으면 됩니다.
+
+```bash
+sudo ./run.sh --primary --ce_pin 25
+sudo ./run.sh --secondary --ce_pin 25
+```
+
+### RX IRQ 옵션
+
+선택적으로 nRF24L01 의 `IRQ` 핀을 보드 GPIO 에 연결한 뒤 `--irq_pin` 으로 지정할 수 있습니다.
+이 옵션을 주면 RX 대기 구간에서 GPIO interrupt 를 사용하고, 주지 않으면 기존 polling 방식으로 동작합니다.
+
+`--irq_pin` 은 이제 아래 두 형식을 모두 받습니다.
+- sysfs global GPIO 번호 예: `518`
+- GPIO line offset 예: `6`
+
+예를 들어 Raspberry Pi 에서 physical pin 31 = GPIO 6 인 경우 아래처럼 offset 기준으로 실행할 수 있습니다.
+
+```bash
+sudo ./run.sh --primary --ce_pin 25 --irq_pin 6
+sudo ./run.sh --secondary --ce_pin 25 --irq_pin 6
+```
+
+기존처럼 sysfs global GPIO 번호를 직접 넣어도 됩니다.
+
+```bash
+sudo ./run.sh --primary --ce_pin 25 --irq_pin 518
+sudo ./run.sh --secondary --ce_pin 25 --irq_pin 518
+```
+
+주의:
+- Coordinator 와 Peer 모두 같은 방식으로 실행하는 것을 권장합니다.
+- 현재 IRQ 구현은 선택적 실험 기능이며, GPIO IRQ 설정에 실패하면 자동으로 polling 으로 폴백합니다.
+- 보드/커널에서 `/sys/class/gpio` 를 지원해야 합니다.
+
 ### RF 튜닝 옵션
 
 다음 옵션으로 nRF24 링크 파라미터를 실행 시점에 조정할 수 있습니다.
@@ -124,36 +162,28 @@ Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
 
 `--rf_retry_delay` 는 RF24 기준 1 step = 250us 이며, 실제 auto-retry delay는 250us ~ 4000us 범위입니다.
 
-현재 1차 권장 실험값은 아래와 같습니다.
+실측 기준 현재는 RF 기본 설정을 그대로 사용하는 쪽이 더 좋았습니다.
 
-- `--rf_data_rate 1mbps`
-- `--rf_crc 16`
-- `--rf_retry_delay 6`
-- `--rf_retry_count 12`
+- `--rf_data_rate 2mbps`
+- `--rf_crc 8`
+- `--rf_retry_delay 0`
+- `--rf_retry_count 15`
 
-예시:
+즉 아래처럼 `--rf_*` 옵션을 생략한 기본 실행이 현재 기준선입니다.
 
 ```bash
-./build/aarch64-release/nerfnet/nerfnet \
-  --primary \
-  --interface_name nerf0 \
-  --tunnel_ip 192.168.10.1 \
-  --channel 1 \
-  --poll_interval_us 100 \
-  --rf_data_rate 1mbps \
-  --rf_crc 16 \
-  --rf_retry_delay 6 \
-  --rf_retry_count 12
+sudo ./run.sh --primary --ce_pin 25
+sudo ./run.sh --secondary --ce_pin 25
 ```
 
-이 권장값은 영상 전송을 위한 고처리량 설정이라기보다, 현재 단계에서 `send_fail` 감소와 소량 UDP/TCP 안정화에 더 초점을 둔 설정입니다.
-즉 링크 안정성에는 유리할 수 있지만, 순수 throughput 자체는 `2mbps` 대비 줄 수 있습니다.
-
+참고:
+- `1mbps + CRC16 + retry_delay 6 + retry_count 12` 도 실험했지만, 현재 보드/환경에서는 기본값보다 지연과 손실이 더 커졌습니다.
+- 따라서 RF 튜닝은 현재는 기본값 유지 상태에서 비교 실험용 옵션으로 보는 것이 맞습니다.
 
 ## 현재 실측 결과
 
-아래 수치는 현재 `1mbps + CRC16 + retry_delay 6 + retry_count 12` 설정과
-현재 MAC 구현 기준에서 측정한 결과입니다.
+아래 수치는 현재 기본 RF 설정(`2mbps + CRC8 + retry_delay 0 + retry_count 15`)과
+`kPostDataExchangeGapUs = 250` pacing 패치 기준에서 측정한 결과입니다.
 
 ### Ping
 

@@ -30,13 +30,15 @@ PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
                                              uint32_t secondary_addr,
                                              uint8_t channel,
                                              uint64_t poll_interval_us,
-                                             const RadioConfig& radio_config)
+                                             const RadioConfig& radio_config,
+                                             int irq_pin)
     : RadioInterface(ce_pin,
                      tunnel_fd,
                      primary_addr,
                      secondary_addr,
                      channel,
-                     radio_config),
+                     radio_config,
+                     irq_pin),
       poll_interval_us_(poll_interval_us),
       current_poll_interval_us_(poll_interval_us),
       poll_fail_count_(0),
@@ -397,8 +399,13 @@ PrimaryRadioInterface::ExchangeResult PrimaryRadioInterface::PerformExchange() {
         static_cast<int>(state_));
   }
 
-  return ApplyPeerResponse(rx) ? ExchangeResult::Success
-                               : ExchangeResult::ProtocolFailure;
+  const bool applied = ApplyPeerResponse(rx);
+  if (applied && (tx.type == FrameType::Data || rx.type == FrameType::Data)) {
+    SleepUs(kPostDataExchangeGapUs);
+  }
+
+  return applied ? ExchangeResult::Success
+                 : ExchangeResult::ProtocolFailure;
 }
 
 void PrimaryRadioInterface::HandleTransactionFailure(FailureType failure_type) {

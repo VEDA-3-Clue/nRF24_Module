@@ -22,6 +22,7 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
+#include <string>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -47,7 +48,8 @@ class RadioInterface : public NonCopyable {
                  uint32_t primary_addr,
                  uint32_t secondary_addr,
                  uint8_t channel,
-                 const RadioConfig& radio_config);
+                 const RadioConfig& radio_config,
+                 int irq_pin = -1);
   virtual ~RadioInterface();
 
   enum class RequestResult {
@@ -111,6 +113,9 @@ class RadioInterface : public NonCopyable {
   std::optional<uint8_t> last_rx_seq_;
 
   bool tunnel_logs_enabled_;
+  const int irq_pin_;
+  int irq_fd_;
+  int resolved_irq_gpio_;
 
   RequestResult Send(const std::vector<uint8_t>& request);
   RequestResult Receive(std::vector<uint8_t>& response, uint64_t timeout_us = 0);
@@ -144,6 +149,12 @@ class RadioInterface : public NonCopyable {
   void WriteTunnel();
 
   bool IsValidIpPacket(const std::vector<uint8_t>& packet) const;
+  bool InitializeIrq();
+  void CleanupIrq();
+  RequestResult WaitForRxReady(uint64_t timeout_us);
+  bool WriteSysfsFile(const std::string& path, const std::string& value);
+  bool ExportIrqGpio(int gpio);
+  std::optional<int> ResolveIrqGpio() const;
 };
 
 }  // namespace nerfnet

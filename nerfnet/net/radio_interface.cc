@@ -17,22 +17,65 @@
 #include "nerfnet/net/radio_interface.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <poll.h>
 #include <string.h>
 #include <unistd.h>
 
 #include <algorithm>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <string>
 
 #include "nerfnet/util/log.h"
 #include "nerfnet/util/time.h"
 
 namespace nerfnet {
 
+namespace {
+
+std::optional<int> ReadIntFile(const std::string& path) {
+  std::ifstream stream(path);
+  int value = 0;
+  if (!(stream >> value)) {
+    return std::nullopt;
+  }
+  return value;
+}
+
+std::string ReadTextFile(const std::string& path) {
+  std::ifstream stream(path);
+  std::string value;
+  std::getline(stream, value);
+  return value;
+}
+
+std::string ToLower(std::string value) {
+  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
+    return static_cast<char>(std::tolower(c));
+  });
+  return value;
+}
+
+bool IsPreferredGpioChipLabel(const std::string& label) {
+  const std::string lower = ToLower(label);
+  return lower.find("pinctrl") != std::string::npos ||
+         lower.find("raspberry") != std::string::npos ||
+         lower.find("bcm") != std::string::npos ||
+         lower.find("gpio") != std::string::npos;
+}
+
+}  // namespace
+
 RadioInterface::RadioInterface(uint16_t ce_pin,
                                int tunnel_fd,
                                uint32_t primary_addr,
                                uint32_t secondary_addr,
                                uint8_t channel,
-                               const RadioConfig& radio_config)
+                               const RadioConfig& radio_config,
+                               int irq_pin)
     : radio_(ce_pin, 0),
       tunnel_fd_(tunnel_fd),
       primary_addr_(primary_addr),
@@ -43,7 +86,10 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
       tx_in_flight_(false),
       tx_inflight_seq_(0),
       tx_inflight_bytes_left_(0),
-      tunnel_logs_enabled_(false) {
+      tunnel_logs_enabled_(false),
+      irq_pin_(irq_pin),
+      irq_fd_(-1),
+      resolved_irq_gpio_(-1) {
   CHECK(channel < 128, "Channel must be between 0 and 127");
   CHECK(radio_.begin(), "Failed to start NRF24L01");
   radio_.setChannel(channel);
@@ -54,6 +100,9 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
   radio_.setRetries(radio_config_.retry_delay, radio_config_.retry_count);
   radio_.setCRCLength(radio_config_.crc_length);
   CHECK(radio_.isChipConnected(), "NRF24L01 is unavailable");
+  if (irq_pin_ >= 0 && !InitializeIrq()) {
+    LOGE("Falling back to RX polling because IRQ setup failed for GPIO %d", irq_pin_);
+  }
 
   tunnel_thread_ = std::thread(&RadioInterface::TunnelThread, this);
 }
@@ -63,6 +112,191 @@ RadioInterface::~RadioInterface() {
   if (tunnel_thread_.joinable()) {
     tunnel_thread_.join();
   }
+  CleanupIrq();
+}
+
+bool RadioInterface::WriteSysfsFile(const std::string& path, const std::string& value) {
+  const int fd = open(path.c_str(), O_WRONLY);
+  if (fd < 0) {
+    return false;
+  }
+
+  const ssize_t bytes_written = write(fd, value.data(), value.size());
+  close(fd);
+  return bytes_written == static_cast<ssize_t>(value.size());
+}
+
+bool RadioInterface::ExportIrqGpio(int gpio) {
+  errno = 0;
+  return WriteSysfsFile("/sys/class/gpio/export", std::to_string(gpio)) || errno == EBUSY;
+}
+
+std::optional<int> RadioInterface::ResolveIrqGpio() const {
+  if (irq_pin_ < 0) {
+    return std::nullopt;
+  }
+
+  std::optional<int> fallback;
+  for (const auto& entry : std::filesystem::directory_iterator("/sys/class/gpio")) {
+    if (!entry.is_directory()) {
+      continue;
+    }
+
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("gpiochip", 0) != 0) {
+      continue;
+    }
+
+    const auto base = ReadIntFile((entry.path() / "base").string());
+    const auto ngpio = ReadIntFile((entry.path() / "ngpio").string());
+    if (!base.has_value() || !ngpio.has_value()) {
+      continue;
+    }
+
+    if (irq_pin_ < 0 || irq_pin_ >= *ngpio) {
+      continue;
+    }
+
+    const int resolved = *base + irq_pin_;
+    const std::string label = ReadTextFile((entry.path() / "label").string());
+    if (IsPreferredGpioChipLabel(label)) {
+      LOGI("Resolved IRQ line offset %d to sysfs GPIO %d via %s",
+           irq_pin_,
+           resolved,
+           name.c_str());
+      return resolved;
+    }
+
+    if (!fallback.has_value()) {
+      fallback = resolved;
+    }
+  }
+
+  if (fallback.has_value()) {
+    LOGI("Resolved IRQ line offset %d to sysfs GPIO %d", irq_pin_, *fallback);
+  }
+  return fallback;
+}
+
+bool RadioInterface::InitializeIrq() {
+  if (irq_pin_ < 0) {
+    return false;
+  }
+
+  int gpio = irq_pin_;
+  if (!ExportIrqGpio(gpio)) {
+    const auto resolved = ResolveIrqGpio();
+    if (!resolved.has_value()) {
+      LOGE("Failed to export IRQ GPIO %d: %s (%d)", irq_pin_, strerror(errno), errno);
+      return false;
+    }
+
+    gpio = *resolved;
+    if (!ExportIrqGpio(gpio)) {
+      LOGE("Failed to export resolved IRQ GPIO %d for requested pin %d: %s (%d)",
+           gpio,
+           irq_pin_,
+           strerror(errno),
+           errno);
+      return false;
+    }
+  }
+
+  resolved_irq_gpio_ = gpio;
+  const std::string gpio_dir = "/sys/class/gpio/gpio" + std::to_string(resolved_irq_gpio_);
+  if (!WriteSysfsFile(gpio_dir + "/direction", "in")) {
+    LOGE("Failed to set IRQ GPIO %d direction", resolved_irq_gpio_);
+    return false;
+  }
+  if (!WriteSysfsFile(gpio_dir + "/edge", "falling")) {
+    LOGE("Failed to set IRQ GPIO %d edge", resolved_irq_gpio_);
+    return false;
+  }
+
+  irq_fd_ = open((gpio_dir + "/value").c_str(), O_RDONLY | O_NONBLOCK);
+  if (irq_fd_ < 0) {
+    LOGE("Failed to open IRQ GPIO %d value: %s (%d)", resolved_irq_gpio_, strerror(errno), errno);
+    return false;
+  }
+
+  char value = 0;
+  lseek(irq_fd_, 0, SEEK_SET);
+  const ssize_t initial_read = read(irq_fd_, &value, 1);
+  (void)initial_read;
+  LOGI("RX IRQ enabled on GPIO %d (requested %d)", resolved_irq_gpio_, irq_pin_);
+  return true;
+}
+
+void RadioInterface::CleanupIrq() {
+  if (irq_fd_ >= 0) {
+    close(irq_fd_);
+    irq_fd_ = -1;
+  }
+
+  if (resolved_irq_gpio_ >= 0) {
+    WriteSysfsFile("/sys/class/gpio/unexport", std::to_string(resolved_irq_gpio_));
+    resolved_irq_gpio_ = -1;
+  }
+}
+
+RadioInterface::RequestResult RadioInterface::WaitForRxReady(uint64_t timeout_us) {
+  if (irq_fd_ < 0) {
+    const uint64_t start_us = TimeNowUs();
+    while (!radio_.available()) {
+      if (timeout_us != 0 && (start_us + timeout_us) < TimeNowUs()) {
+        LOGE("Timeout receiving response");
+        return RequestResult::Timeout;
+      }
+      SleepUs(50);
+    }
+    return RequestResult::Success;
+  }
+
+  const uint64_t deadline_us = timeout_us == 0 ? 0 : (TimeNowUs() + timeout_us);
+  while (!radio_.available()) {
+    struct pollfd pfd = {};
+    pfd.fd = irq_fd_;
+    pfd.events = POLLPRI | POLLERR;
+
+    int timeout_ms = -1;
+    if (deadline_us != 0) {
+      const uint64_t now_us = TimeNowUs();
+      if (now_us >= deadline_us) {
+        LOGE("Timeout receiving response");
+        return RequestResult::Timeout;
+      }
+      const uint64_t remaining_us = deadline_us - now_us;
+      timeout_ms = static_cast<int>((remaining_us + 999) / 1000);
+      if (timeout_ms == 0) {
+        timeout_ms = 1;
+      }
+    }
+
+    char value = 0;
+    lseek(irq_fd_, 0, SEEK_SET);
+    const ssize_t clear_before_poll = read(irq_fd_, &value, 1);
+    (void)clear_before_poll;
+
+    const int poll_result = poll(&pfd, 1, timeout_ms);
+    if (poll_result < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      LOGE("IRQ poll failed: %s (%d)", strerror(errno), errno);
+      return RequestResult::Timeout;
+    }
+
+    if (poll_result == 0) {
+      LOGE("Timeout receiving response");
+      return RequestResult::Timeout;
+    }
+
+    lseek(irq_fd_, 0, SEEK_SET);
+    const ssize_t clear_after_poll = read(irq_fd_, &value, 1);
+    (void)clear_after_poll;
+  }
+
+  return RequestResult::Success;
 }
 
 RadioInterface::RequestResult RadioInterface::Send(
@@ -90,13 +324,9 @@ RadioInterface::RequestResult RadioInterface::Receive(
     uint64_t timeout_us) {
   radio_.startListening();
 
-  const uint64_t start_us = TimeNowUs();
-  while (!radio_.available()) {
-    if (timeout_us != 0 && (start_us + timeout_us) < TimeNowUs()) {
-      LOGE("Timeout receiving response");
-      return RequestResult::Timeout;
-    }
-    SleepUs(50);
+  const auto wait_result = WaitForRxReady(timeout_us);
+  if (wait_result != RequestResult::Success) {
+    return wait_result;
   }
 
   radio_.read(response.data(), response.size());

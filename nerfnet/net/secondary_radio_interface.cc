@@ -27,13 +27,15 @@ SecondaryRadioInterface::SecondaryRadioInterface(uint16_t ce_pin,
                                                  uint32_t primary_addr,
                                                  uint32_t secondary_addr,
                                                  uint8_t channel,
-                                                 const RadioConfig& radio_config)
+                                                 const RadioConfig& radio_config,
+                                                 int irq_pin)
     : RadioInterface(ce_pin,
                      tunnel_fd,
                      primary_addr,
                      secondary_addr,
                      channel,
-                     radio_config),
+                     radio_config,
+                     irq_pin),
       granted_to_send_(false), grant_budget_(0) {
   uint8_t writing_addr[5] = {
       static_cast<uint8_t>(secondary_addr),

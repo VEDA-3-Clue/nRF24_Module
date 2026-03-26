@@ -133,6 +133,9 @@ int main(int argc, char** argv) {
   TCLAP::ValueArg<uint16_t> ce_pin_arg("", "ce_pin",
       "Set to the index of the NRF24L01 chip-enable pin.", false, 22, "index",
       cmd);
+  TCLAP::ValueArg<int> irq_pin_arg("", "irq_pin",
+      "Optional IRQ GPIO. Accepts either a sysfs global GPIO number or a line offset such as BCM GPIO 6.", false, -1, "index",
+      cmd);
   TCLAP::SwitchArg primary_arg("", "primary",
       "Run this side of the network in primary mode.", false);
   TCLAP::SwitchArg secondary_arg("", "secondary",
@@ -207,14 +210,15 @@ int main(int argc, char** argv) {
     nerfnet::PrimaryRadioInterface radio_interface(
         ce_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-        channel_arg.getValue(), poll_interval_us_arg.getValue(), radio_config);
+        channel_arg.getValue(), poll_interval_us_arg.getValue(), radio_config,
+        irq_pin_arg.getValue());
     radio_interface.SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
     radio_interface.Run();
   } else if (secondary_arg.getValue()) {
     nerfnet::SecondaryRadioInterface radio_interface(
         ce_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-        channel_arg.getValue(), radio_config);
+        channel_arg.getValue(), radio_config, irq_pin_arg.getValue());
     radio_interface.SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
     radio_interface.Run();
   } else {
