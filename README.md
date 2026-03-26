@@ -151,7 +151,7 @@ sudo ./run.sh --secondary --ce_pin 25 --irq_pin 518
 주의:
 - Coordinator 와 Peer 모두 같은 방식으로 실행하는 것을 권장합니다.
 - 현재 IRQ 구현은 선택적 실험 기능이며, GPIO IRQ 설정에 실패하면 자동으로 polling 으로 폴백합니다.
-- 보드/커널에서 `/sys/class/gpio` 를 지원해야 합니다.
+- 현재 구현은 `libgpiod` 기반이며, line offset 방식 사용을 권장합니다.
 
 ### RF 튜닝 옵션
 
@@ -184,45 +184,85 @@ sudo ./run.sh --secondary --ce_pin 25
 
 ## 현재 실측 결과
 
-아래 수치는 현재 기본 RF 설정(`2mbps + CRC8 + retry_delay 0 + retry_count 15`)과
-`kPostDataExchangeGapUs = 250` pacing 패치 기준에서 측정한 결과입니다.
+아래 표와 수치는 지금까지의 대표 실험 결과를 단계/버전별로 정리한 것입니다.
+현재 가장 안정적으로 보이는 조합은 기본 RF 설정(`2mbps + CRC8 + retry_delay 0 + retry_count 15`),
+`kPostDataExchangeGapUs = 250` pacing, `libgpiod` 기반 RX IRQ(`--irq_pin 6`)입니다.
 
-### Ping
+### 단계별 요약
 
-- 기본 ping: `0% loss`, 평균 RTT 약 `198 ms`
-- `ping -s 32`: `0% loss`, 평균 RTT 약 `146 ms`
-- `ping -s 128`: `0% loss`, 평균 RTT 약 `262 ms`
-- `ping -s 256`: 약 `5% loss`, 평균 RTT 약 `313 ms`
+| 단계 | 주요 변경 | 대표 결과 | 해석 |
+| --- | --- | --- | --- |
+| 초기 안정화 이전 | duplicate DATA 미처리, reassembly 검증 부족 | 큰 payload 에서 링크 붕괴 잦음 | 구조 자체보다 recovery/validation 부족이 문제였음 |
+| 공통 안정화 적용 | duplicate DATA 허용, invalid reassembled packet drop, busy-wait 완화 | 기본 ping/`32B` 안정화 | 링크가 복구 가능한 느린 저대역 상태로 올라옴 |
+| 기본 RF + grant 3 정착 | `kDefaultBurstGrant = 3` 유지 | `128B`까지 실사용 가능 수준 | MAC 기본 방향은 유지 가능 |
+| pacing 적용 | `kPostDataExchangeGapUs = 250` | `ping -s 256`에서 `0% loss`, avg 약 `328 ms` | 큰 payload 안정성 개선 |
+| IRQ 정착 | `libgpiod` 기반 RX IRQ + pacing 유지 | `ping -s 256`에서 `0% loss`, avg 약 `331 ms` | IRQ는 CPU/수신 대기 개선용으로 유효, 핵심 병목은 여전히 `send_fail` |
+
+### 버전별 비교
+
+| 버전/조합 | 실행 조건 | `ping -s 256` 결과 | 비고 |
+| --- | --- | --- | --- |
+| 기본 RF, 초기 안정화 직후 | polling | 약 `71% loss`, avg 약 `840 ms` | 큰 payload 는 아직 붕괴 구간 |
+| 기본 RF, 안정화 후 | polling | 약 `5% loss`, avg 약 `313 ms` | `256B`가 사용 가능한 단계로 올라옴 |
+| 기본 RF + pacing `250us` | polling | `0% loss`, avg 약 `328 ms` | 현재 채택 후보의 출발점 |
+| 기본 RF + pacing `250us` + sysfs IRQ 시도 실패 | polling fallback | `0% loss`, avg 약 `312 ms` | 실제 IRQ 효과는 아님 |
+| 기본 RF + pacing `250us` + `libgpiod` IRQ | `--irq_pin 6` | `0% loss`, avg 약 `331 ms` | 현재 기준선 |
+| `1mbps + CRC16 + retry_delay 6 + retry_count 12` | RF 튜닝 실험 | 약 `22% loss`, avg 약 `782 ms` | 기본값보다 나쁨 |
+| `retry_delay 8`, `retry_count 12` | RF 튜닝 실험 | 약 `19% loss`, avg 약 `997 ms` | 탈락 |
+| `retry_delay 6`, `retry_count 10` | RF 튜닝 실험 | 약 `16% loss`, avg 약 `748 ms` | 탈락 |
+| TX recovery 에서 강제 `startListening()` 포함 | 회귀 실험 | 약 `22% loss`, avg 약 `474 ms` | recovery 방향이 오히려 성능 악화 |
+| TX recovery 를 `flush_tx + gap` 만 유지 | 현재 | `0% loss`, avg 약 `331 ms` | 현재 가장 무난한 상태 |
+| fairness 1차 적용 | peer pending 시 coord local DATA burst 2개 후 `Grant` 우선 | 양방향 `256B @ 10k` 경쟁에서도 양측 `0% loss` | 역방향 starvation 완화 방향 확인 |
+
+### Ping 세부 결과
+
+현재 기준선 조합에서 측정한 대표값: 
+
+| 테스트 | 결과 |
+| --- | --- |
+| 기본 ping | `0% loss`, 평균 RTT 약 `198 ms` |
+| `ping -s 32` | `0% loss`, 평균 RTT 약 `146 ms` |
+| `ping -s 128` | `0% loss`, 평균 RTT 약 `262 ms` |
+| `ping -s 256` | 최근 안정 구간에서 `0% loss`, 평균 RTT 약 `331 ms` |
 
 해석:
 - 작은 payload는 안정적입니다.
 - `128B`도 현재는 안정적으로 수신됩니다.
-- `256B`는 사용 가능하지만 지연과 재전송 비용이 여전히 존재합니다.
+- `256B`도 현재 조합에서는 `0% loss`로 안정화되는 구간을 확인했습니다. 다만 `send_fail` 자체는 아직 남아 있으므로 장시간/고부하 상황에서는 지연 증가 가능성이 있습니다.
 
 ### TCP 간단 검증
 
-- `nc` 기반 echo 테스트에서 `4 KiB` 수준의 데이터 왕복 확인
-- 작은 TCP interactive / 지속 전송은 가능
-- 다만 더 큰 지속 전송에서는 여전히 지연 누적 가능성 있음
+| 테스트 | 결과 |
+| --- | --- |
+| `nc` echo | `4 KiB` 수준 데이터 왕복 확인 |
+| 작은 TCP interactive / 지속 전송 | 가능 |
+| 더 큰 지속 전송 | 지연 누적 가능성 있음 |
 
 ### UDP 실측
 
 `iperf3 -u` 기준 측정:
 
-- `64B @ 10k`: sender `0% loss`
-- `128B @ 10k`: sender `0% loss`
-- `256B @ 10k`: receiver 약 `1% loss`, jitter 약 `55 ms`
-- `256B @ 15k`: receiver `0% loss`, jitter 약 `140 ms`, receiver completion time 약 `39.7 s`
-- `256B @ 20k`: receiver 약 `1% loss`, jitter 약 `179 ms`, receiver completion time 약 `54.7 s`
+| 테스트 | 결과 | 비고 |
+| --- | --- | --- |
+| `64B @ 10k` | sender `0% loss` | 안정적 |
+| `128B @ 10k` | sender `0% loss` | 안정적 |
+| `256B @ 10k` | receiver 약 `1% loss`, jitter 약 `55 ms` | 저속 운용 가능 |
+| `256B @ 10k` reverse (`PEER -> COORD`) | receiver `0% loss`, jitter 약 `32.4 ms`, completion time 약 `20.1 s` | 단방향 reverse 경로는 더 양호 |
+| `256B @ 10k` bidirectional 경쟁 | `COORD -> PEER`: receiver `0% loss`, jitter 약 `73.7 ms`, completion time 약 `31.7 s`
+`PEER -> COORD`: receiver `0% loss`, jitter 약 `11.8 ms`, completion time 약 `21.8 s` | fairness 1차 적용 후 양방향 경쟁에서도 유지 |
+| `256B @ 15k` | receiver `0.68% loss`, jitter 약 `134 ms`, completion time 약 `40.5 s` | 가능하지만 지연 증가 |
+| `256B @ 20k` | receiver 약 `1% loss`, jitter 약 `179 ms`, completion time 약 `54.7 s` | 실시간성 크게 악화 |
 
 해석:
 - 현재 링크는 `256B`에서도 낮은 loss로 버틸 수 있습니다.
+- reverse 단독(`PEER -> COORD`)과 fairness 적용 후 양방향 경쟁 모두에서 `10k` 수준은 유지되었습니다.
 - 하지만 bitrate를 올리면 손실보다 먼저 queue buildup 과 latency inflation 이 커집니다.
-- 현재 기준으로 `256B payload`의 안정 운용점은 대략 `10k` 부근으로 보는 것이 합리적입니다.
+- 현재 기준으로 `256B payload`의 안정 운용점은 대략 `10k` 부근, `15k`는 가능한 대신 지연 증가를 감수하는 구간으로 보는 것이 합리적입니다.
 
 ### 현재 단계 평가
 
 - 링크 안정화와 MAC 신뢰성 확보는 상당 부분 달성됨
 - 작은 UDP/TCP는 안정화 단계에 진입
-- 현재 남은 핵심 과제는 대역폭 확대보다는 지연 감소와 처리율 개선
-- 다음 우선순위는 RF 재시도 미세조정, failure handling 보강, IRQ 검토 순서가 적절함
+- `libgpiod` 기반 IRQ와 `250us` pacing은 현재 기준 채택 가능한 조합
+- fairness 1차 적용은 양방향 경쟁에서 의미 있는 개선 후보로 보임
+- 현재 남은 핵심 과제는 대역폭 확대보다는 지연 감소와 `send_fail` 완화

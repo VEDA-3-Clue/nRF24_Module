@@ -200,6 +200,7 @@ bool PrimaryRadioInterface::ConnectionReset() {
   peer_has_pending_ = false;
   peer_grant_budget_ = 0;
   last_tx_was_data_ = false;
+  consecutive_local_data_frames_ = 0;
 
   MacFrame tx;
   tx.type = FrameType::Reset;
@@ -267,6 +268,15 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
 
     case CoordinatorState::Idle:
       if (local_has_data) {
+        if (peer_has_pending_ && consecutive_local_data_frames_ >= kFairDataBurstLimit) {
+          tx.type = FrameType::Grant;
+          tx.pending = 1;
+          tx.arg = kDefaultBurstGrant;
+          last_tx_was_data_ = false;
+          ++tx_grant_count_;
+          return true;
+        }
+
         std::lock_guard<std::mutex> lock(read_buffer_mutex_);
         if (!BuildNextDataFrameLocked(tx)) {
           return false;
@@ -400,6 +410,19 @@ PrimaryRadioInterface::ExchangeResult PrimaryRadioInterface::PerformExchange() {
   }
 
   const bool applied = ApplyPeerResponse(rx);
+  if (applied) {
+    if (tx.type == FrameType::Data && rx.type != FrameType::Data) {
+      consecutive_local_data_frames_ =
+          static_cast<uint8_t>(std::min<unsigned>(consecutive_local_data_frames_ + 1, 255));
+    } else if (tx.type != FrameType::Data || rx.type == FrameType::Data) {
+      consecutive_local_data_frames_ = 0;
+    }
+  }
+
+  if (!applied) {
+    consecutive_local_data_frames_ = 0;
+  }
+
   if (applied && (tx.type == FrameType::Data || rx.type == FrameType::Data)) {
     SleepUs(kPostDataExchangeGapUs);
   }

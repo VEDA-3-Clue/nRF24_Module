@@ -55,6 +55,7 @@ private:
   static constexpr uint64_t kIdlePollIntervalUs = 20000;
   static constexpr uint64_t kActivePollIntervalUs = 1000;
   static constexpr uint64_t kPostDataExchangeGapUs = 250;
+  static constexpr uint8_t kFairDataBurstLimit = 2;
 
   static constexpr int kDisconnectFailureThreshold = 5;
   static constexpr uint64_t kInitialDisconnectBackoffUs = 100000;   // 100 ms
@@ -88,6 +89,7 @@ private:
 
   bool peer_has_pending_;
   bool last_tx_was_data_;
+  uint8_t consecutive_local_data_frames_ = 0;
 
   uint64_t idle_log_counter_ = 0;
   uint64_t stat_loop_counter_ = 0;

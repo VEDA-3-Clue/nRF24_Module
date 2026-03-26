@@ -386,6 +386,12 @@ RadioInterface::RequestResult RadioInterface::WaitForRxReady(uint64_t timeout_us
   return RequestResult::Success;
 }
 
+void RadioInterface::RecoverAfterTransmitFailure(const char* stage) {
+  LOGE("TX recovery after %s failure", stage);
+  radio_.flush_tx();
+  SleepUs(kTxFailureRecoveryGapUs);
+}
+
 RadioInterface::RequestResult RadioInterface::Send(
     const std::vector<uint8_t>& request) {
   radio_.stopListening();
@@ -397,10 +403,17 @@ RadioInterface::RequestResult RadioInterface::Send(
 
   if (!radio_.write(request.data(), request.size())) {
     LOGE("Failed to write request");
+    RecoverAfterTransmitFailure("write");
     return RequestResult::TransmitError;
   }
 
+  const uint64_t standby_deadline_us = TimeNowUs() + kTxStandbyTimeoutUs;
   while (!radio_.txStandBy()) {
+    if (TimeNowUs() >= standby_deadline_us) {
+      LOGE("Timed out waiting for TX standby");
+      RecoverAfterTransmitFailure("txStandBy");
+      return RequestResult::TransmitError;
+    }
     SleepUs(50);
   }
   return RequestResult::Success;

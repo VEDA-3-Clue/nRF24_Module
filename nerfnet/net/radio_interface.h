@@ -84,6 +84,8 @@ class RadioInterface : public NonCopyable {
 
  protected:
   static constexpr uint32_t kPollIntervalUs = 1000;
+  static constexpr uint32_t kTxStandbyTimeoutUs = 20000;
+  static constexpr uint32_t kTxFailureRecoveryGapUs = 200;
   static constexpr size_t kMaxPacketSize = 32;
   static constexpr size_t kHeaderSize = 5;
   static constexpr size_t kMaxPayloadSize = kMaxPacketSize - kHeaderSize;
@@ -158,6 +160,7 @@ class RadioInterface : public NonCopyable {
   bool InitializeIrq();
   void CleanupIrq();
   RequestResult WaitForRxReady(uint64_t timeout_us);
+  void RecoverAfterTransmitFailure(const char* stage);
 };
 
 }  // namespace nerfnet
