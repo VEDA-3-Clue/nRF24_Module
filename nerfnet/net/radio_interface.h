@@ -113,6 +113,8 @@ class RadioInterface : public NonCopyable {
   // Sequence helpers.
   void AdvanceTxSeq();
   bool IsExpectedRxSeq(uint8_t seq) const;
+  uint8_t NextSeq(uint8_t seq) const;
+  void ResetRxAssemblyLocked();
 
   // Thread that reads from TUN and buffers complete IP frames.
   void TunnelThread();
@@ -130,6 +132,8 @@ class RadioInterface : public NonCopyable {
 
   // Flush current reassembled IP frame to TUN.
   void WriteTunnel();
+
+  bool IsValidIpPacket(const std::vector<uint8_t>& packet) const;
 };
 
 }  // namespace nerfnet

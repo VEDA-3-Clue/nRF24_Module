@@ -120,6 +120,13 @@ void RadioInterface::AdvanceTxSeq() {
   }
 }
 
+uint8_t RadioInterface::NextSeq(uint8_t seq) const {
+  if (seq == 0 || seq >= kMaxSeq) {
+    return 1;
+  }
+  return static_cast<uint8_t>(seq + 1);
+}
+
 bool RadioInterface::IsExpectedRxSeq(uint8_t seq) const {
   if (seq == 0) {
     return false;
@@ -127,10 +134,12 @@ bool RadioInterface::IsExpectedRxSeq(uint8_t seq) const {
   if (!last_rx_seq_.has_value()) {
     return true;
   }
-  if (last_rx_seq_.value() == kMaxSeq) {
-    return seq == 1;
-  }
-  return seq == static_cast<uint8_t>(last_rx_seq_.value() + 1);
+  return seq == NextSeq(last_rx_seq_.value());
+}
+
+void RadioInterface::ResetRxAssemblyLocked() {
+  frame_buffer_.clear();
+  last_rx_seq_.reset();
 }
 
 void RadioInterface::TunnelThread() {
@@ -263,15 +272,30 @@ bool RadioInterface::ConsumeDataFrameLocked(const MacFrame& frame) {
   if (frame.type != FrameType::Data) {
     return true;
   }
+
   if (frame.seq == 0) {
     LOGE("DATA frame missing seq");
+    ResetRxAssemblyLocked();
     return false;
   }
-  if (!IsExpectedRxSeq(frame.seq)) {
-    LOGE("Received non-sequential DATA seq=%u last=%u",
-         frame.seq,
-         last_rx_seq_.value_or(0));
-    return false;
+
+  if (last_rx_seq_.has_value()) {
+    const uint8_t last = last_rx_seq_.value();
+    const uint8_t expected = NextSeq(last);
+
+    if (frame.seq == last) {
+      // Duplicate retransmission. ACK만 다시 보내게 하고 payload는 다시 붙이지 않는다.
+      return true;
+    }
+
+    if (frame.seq != expected) {
+      LOGE("Received unexpected DATA seq=%u expected=%u last=%u",
+           frame.seq,
+           expected,
+           last);
+      ResetRxAssemblyLocked();
+      return false;
+    }
   }
 
   last_rx_seq_ = frame.seq;
@@ -285,19 +309,71 @@ bool RadioInterface::ConsumeDataFrameLocked(const MacFrame& frame) {
       WriteTunnel();
     }
   }
+
   return true;
 }
 
+bool RadioInterface::IsValidIpPacket(const std::vector<uint8_t>& packet) const {
+  if (packet.empty()) {
+    return false;
+  }
+
+  const uint8_t version = static_cast<uint8_t>(packet[0] >> 4);
+
+  if (version == 4) {
+    if (packet.size() < 20) {
+      return false;
+    }
+
+    const size_t ihl = static_cast<size_t>(packet[0] & 0x0F) * 4;
+    if (ihl < 20 || packet.size() < ihl) {
+      return false;
+    }
+
+    const uint16_t total_len =
+        static_cast<uint16_t>((static_cast<uint16_t>(packet[2]) << 8) |
+                              static_cast<uint16_t>(packet[3]));
+    if (total_len < ihl) {
+      return false;
+    }
+
+    return packet.size() == total_len;
+  }
+
+  if (version == 6) {
+    if (packet.size() < 40) {
+      return false;
+    }
+
+    const uint16_t payload_len =
+        static_cast<uint16_t>((static_cast<uint16_t>(packet[4]) << 8) |
+                              static_cast<uint16_t>(packet[5]));
+    return packet.size() == static_cast<size_t>(40 + payload_len);
+  }
+
+  return false;
+}
+
 void RadioInterface::WriteTunnel() {
-  const int bytes_written =
-      write(tunnel_fd_, frame_buffer_.data(), frame_buffer_.size());
   if (tunnel_logs_enabled_) {
     LOGI("Writing %zu bytes to tunnel", frame_buffer_.size());
   }
+
+  if (!IsValidIpPacket(frame_buffer_)) {
+    LOGE("Dropping invalid reassembled IP packet len=%zu", frame_buffer_.size());
+    frame_buffer_.clear();
+    last_rx_seq_.reset();
+    return;
+  }
+
+  const int bytes_written =
+      write(tunnel_fd_, frame_buffer_.data(), frame_buffer_.size());
+
   frame_buffer_.clear();
 
   if (bytes_written < 0) {
     LOGE("Failed to write to tunnel %s (%d)", strerror(errno), errno);
+    last_rx_seq_.reset();
   }
 }
 

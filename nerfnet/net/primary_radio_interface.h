@@ -47,7 +47,7 @@ private:
   static constexpr uint64_t kIdlePollIntervalUs = 20000;
   static constexpr uint64_t kActivePollIntervalUs = 1000;
 
-  static constexpr int kDisconnectFailureThreshold = 3;
+  static constexpr int kDisconnectFailureThreshold = 5;
   static constexpr uint64_t kInitialDisconnectBackoffUs = 100000;   // 100 ms
   static constexpr uint64_t kMaxDisconnectBackoffUs = 1000000;      // 1 s
   static constexpr uint64_t kDisconnectedSleepSliceUs = 1000;       // 1 ms
