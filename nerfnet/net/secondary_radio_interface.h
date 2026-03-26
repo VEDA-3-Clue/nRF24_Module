@@ -37,6 +37,22 @@ class SecondaryRadioInterface : public RadioInterface {
   uint8_t grant_budget_;
   bool granted_to_send_;
   uint64_t idle_log_counter_ = 0;
+  uint64_t tx_pending_count_ = 0;
+  uint64_t tx_data_count_ = 0;
+  uint64_t tx_ack_count_ = 0;
+  uint64_t tx_reset_count_ = 0;
+  uint64_t rx_pending_count_ = 0;
+  uint64_t rx_grant_count_ = 0;
+  uint64_t rx_ack_count_ = 0;
+  uint64_t rx_data_count_ = 0;
+  uint64_t rx_reset_count_ = 0;
+  uint64_t tx_send_fail_count_ = 0;
+  uint64_t tx_send_fail_pending_count_ = 0;
+  uint64_t tx_send_fail_grant_count_ = 0;
+  uint64_t tx_send_fail_data_count_ = 0;
+  uint64_t tx_send_fail_ack_count_ = 0;
+  uint64_t tx_send_fail_reset_count_ = 0;
+  uint64_t last_stat_print_us_ = 0;
 
   bool HandleReset();
   bool ApplyCoordinatorRequest(const MacFrame& request);
@@ -44,6 +60,9 @@ class SecondaryRadioInterface : public RadioInterface {
 
   void LogPeerRx(const MacFrame& rx);
   void LogPeerTx(const MacFrame& tx);
+  void RecordRx(const MacFrame& rx);
+  void RecordTx(const MacFrame& tx);
+  void RecordSendFailure(FrameType frame_type);
 };
 
 }  // namespace nerfnet

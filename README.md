@@ -182,6 +182,43 @@ sudo ./run.sh --secondary --ce_pin 25
 - `1mbps + CRC16 + retry_delay 6 + retry_count 12` 도 실험했지만, 현재 보드/환경에서는 기본값보다 지연과 손실이 더 커졌습니다.
 - 따라서 RF 튜닝은 현재는 기본값 유지 상태에서 비교 실험용 옵션으로 보는 것이 맞습니다.
 
+## 현재 기준선
+
+현재 코드는 아래 조합을 기준선으로 유지합니다. 이 기준선은 가장 좋았던 실측 결과를 보였던 축을 기준으로 정리한 것이며, 최근의 미세 실험 중 성능 개선이 입증되지 않은 것은 채택하지 않았습니다.
+
+### 기준선에 남긴 것
+
+- RF 설정: 기본값 유지 (`2mbps + CRC8 + retry_delay 0 + retry_count 15`)
+- MAC 기본값: `kDefaultBurstGrant = 3`
+- 안정화 패치: duplicate DATA 허용, invalid reassembled packet drop, TUN read sanity check
+- CPU/타이밍 개선: busy-wait 완화, `kPostDataExchangeGapUs = 250`
+- IRQ: `libgpiod` 기반 RX IRQ (`--irq_pin 6` 같은 GPIO line offset 권장)
+- fairness 1차: peer `pending=1`일 때 coordinator local DATA burst를 2개로 제한 후 `Grant` 우선
+- TX failure recovery: `flush_tx + short gap`만 유지, 강제 `startListening()` recovery는 사용하지 않음
+- 계측 유지: frame type별 `send_fail` 카운터 (`sf_pend/sf_grant/sf_data/sf_ack/sf_reset`)
+
+### 기준선에서 채택하지 않은 것
+
+- RF 튜닝 실험: `1mbps + CRC16 + retry_delay 6 + retry_count 12` 등은 기본값보다 나빴음
+- 더 긴 pacing: `500us`는 `250us`보다 나빴음
+- TX recovery 에서 강제 `startListening()` 추가: 성능 회귀 발생
+- `Grant/Ack` 전용 turnaround gap: 개선 불충분, 일부 구간에서 오히려 악화
+- 최근 실험 중 성능 향상이 재현되지 않은 미세 timing tweak 들은 현재 baseline 에 포함하지 않음
+
+### 기준선 실행 예시
+
+```bash
+sudo ./run.sh --primary --ce_pin 25 --irq_pin 6
+sudo ./run.sh --secondary --ce_pin 25 --irq_pin 6
+```
+
+IRQ 없이 비교할 때는 아래처럼 실행합니다.
+
+```bash
+sudo ./run.sh --primary --ce_pin 25
+sudo ./run.sh --secondary --ce_pin 25
+```
+
 ## 현재 실측 결과
 
 아래 표와 수치는 지금까지의 대표 실험 결과를 단계/버전별로 정리한 것입니다.
@@ -213,6 +250,28 @@ sudo ./run.sh --secondary --ce_pin 25
 | TX recovery 에서 강제 `startListening()` 포함 | 회귀 실험 | 약 `22% loss`, avg 약 `474 ms` | recovery 방향이 오히려 성능 악화 |
 | TX recovery 를 `flush_tx + gap` 만 유지 | 현재 | `0% loss`, avg 약 `331 ms` | 현재 가장 무난한 상태 |
 | fairness 1차 적용 | peer pending 시 coord local DATA burst 2개 후 `Grant` 우선 | 양방향 `256B @ 10k` 경쟁에서도 양측 `0% loss` | 역방향 starvation 완화 방향 확인 |
+
+### 실험 명령 요약
+
+아래 명령들은 실제로 Coordinator(`192.168.10.1`)와 Peer(`192.168.10.2`)에서 사용한 테스트 예시입니다.
+
+| 목적 | Coordinator 에서 실행 | Peer 에서 실행 |
+| --- | --- | --- |
+| 기본 ping | `ping 192.168.10.2` | - |
+| payload ping | `ping 192.168.10.2 -s 32`
+`ping 192.168.10.2 -s 128`
+`ping 192.168.10.2 -s 256` | - |
+| TCP echo 확인 | `echo "hello" | nc 192.168.10.2 12345`
+`yes test | head -c 4096 | nc 192.168.10.2 12345` | `rm -f /tmp/nc_fifo && mkfifo /tmp/nc_fifo`
+`while true; do cat /tmp/nc_fifo | nc -l 12345 | tee /tmp/nc_fifo; done` |
+| UDP 단방향 (`COORD -> PEER`) | `iperf3 -c 192.168.10.2 -u -l 64 -b 10k -t 20`
+`iperf3 -c 192.168.10.2 -u -l 128 -b 10k -t 20`
+`iperf3 -c 192.168.10.2 -u -l 256 -b 10k -t 20`
+`iperf3 -c 192.168.10.2 -u -l 256 -b 15k -t 20`
+`iperf3 -c 192.168.10.2 -u -l 256 -b 20k -t 20` | `iperf3 -s` |
+| UDP reverse (`PEER -> COORD`) | `iperf3 -s` | `iperf3 -c 192.168.10.1 -u -l 256 -b 10k -t 20` |
+| UDP 양방향 경쟁 | `iperf3 -c 192.168.10.2 -u -l 256 -b 10k -t 20` | `iperf3 -c 192.168.10.1 -u -l 256 -b 10k -t 20` |
+| 테스트 영상 송신 | `ffmpeg -i udp://0.0.0.0:5000 -t 60 -c copy out.ts` | `ffmpeg -re -f lavfi -i testsrc=size=128x96:rate=1 -vf format=gray -c:v libx264 -preset ultrafast -tune zerolatency -g 1 -bf 0 -b:v 8k -maxrate 8k -bufsize 4k -f mpegts udp://192.168.10.1:5000` |
 
 ### Ping 세부 결과
 
@@ -263,6 +322,17 @@ sudo ./run.sh --secondary --ce_pin 25
 
 - 링크 안정화와 MAC 신뢰성 확보는 상당 부분 달성됨
 - 작은 UDP/TCP는 안정화 단계에 진입
-- `libgpiod` 기반 IRQ와 `250us` pacing은 현재 기준 채택 가능한 조합
+- `libgpiod` 기반 IRQ와 `250us` pacing은 현재 기준 채택 조합
 - fairness 1차 적용은 양방향 경쟁에서 의미 있는 개선 후보로 보임
+- 초저비트레이트 테스트 영상(`128x96`, `1fps`, 대략 `8~11 kbit/s`)은 수신 저장 후 재생 가능
 - 현재 남은 핵심 과제는 대역폭 확대보다는 지연 감소와 `send_fail` 완화
+
+### 현재 한계
+
+- `send_fail`과 `rx_timeout`은 여전히 누적되며, 링크는 이를 재전송으로 간신히 흡수하는 상태입니다.
+- frame type별 계측상 coordinator 는 `Grant/Data`, peer 는 `Ack` 쪽 failure 비중이 큽니다.
+- 긴 연속 스트림은 `27B` 조각으로 많이 쪼개져 MAC 왕복 오버헤드가 큽니다.
+- `256B payload`는 `10k` 부근이 안정 운용점이고, `15k~20k`로 올리면 손실보다 먼저 지연과 completion time 이 악화됩니다.
+- reverse(`PEER -> COORD`)가 `COORD -> PEER`보다 여전히 더 좋은 경향이 있습니다.
+- 영상은 가능하더라도 현재는 일반적인 스트리밍이 아니라 초저해상도/저fps feasibility 수준입니다.
+- 따라서 다음 튜닝 방향은 RF/IRQ 미세조정보다 control-frame 오버헤드와 `send_fail` 완화에 맞추는 것이 적절합니다.

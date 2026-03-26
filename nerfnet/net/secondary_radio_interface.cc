@@ -19,6 +19,7 @@
 #include <vector>
 
 #include "nerfnet/util/log.h"
+#include "nerfnet/util/time.h"
 
 namespace nerfnet {
 
@@ -69,6 +70,8 @@ void SecondaryRadioInterface::Run() {
       continue;
     }
 
+    RecordRx(rx);
+
     if (rx.type == FrameType::Reset) {
       if (!HandleReset()) {
         LOGE("[PEER] reset handling failed");
@@ -95,8 +98,12 @@ void SecondaryRadioInterface::Run() {
 
     result = Send(response);
     if (result != RequestResult::Success) {
+      ++tx_send_fail_count_;
+      RecordSendFailure(tx.type);
       LOGE("[PEER] send failed");
     }
+
+    RecordTx(tx);
 
     bool is_idle_pair =
     (rx.type == FrameType::Pending && tx.type == FrameType::Ack);
@@ -104,6 +111,32 @@ void SecondaryRadioInterface::Run() {
     if (!is_idle_pair || (idle_log_counter_++ % 100 == 0)) {
       LogPeerRx(rx);
       LogPeerTx(tx);
+    }
+
+    const uint64_t stat_now_us = TimeNowUs();
+    if (last_stat_print_us_ == 0) {
+      last_stat_print_us_ = stat_now_us;
+    }
+    if (stat_now_us - last_stat_print_us_ >= 1000000) {
+      LOGI("[PEER][STAT] pend_tx=%llu data_tx=%llu ack_tx=%llu reset_tx=%llu "
+           "grant_rx=%llu pend_rx=%llu ack_rx=%llu data_rx=%llu reset_rx=%llu "
+           "send_fail=%llu sf_pend=%llu sf_grant=%llu sf_data=%llu sf_ack=%llu sf_reset=%llu",
+           static_cast<unsigned long long>(tx_pending_count_),
+           static_cast<unsigned long long>(tx_data_count_),
+           static_cast<unsigned long long>(tx_ack_count_),
+           static_cast<unsigned long long>(tx_reset_count_),
+           static_cast<unsigned long long>(rx_grant_count_),
+           static_cast<unsigned long long>(rx_pending_count_),
+           static_cast<unsigned long long>(rx_ack_count_),
+           static_cast<unsigned long long>(rx_data_count_),
+           static_cast<unsigned long long>(rx_reset_count_),
+           static_cast<unsigned long long>(tx_send_fail_count_),
+           static_cast<unsigned long long>(tx_send_fail_pending_count_),
+           static_cast<unsigned long long>(tx_send_fail_grant_count_),
+           static_cast<unsigned long long>(tx_send_fail_data_count_),
+           static_cast<unsigned long long>(tx_send_fail_ack_count_),
+           static_cast<unsigned long long>(tx_send_fail_reset_count_));
+      last_stat_print_us_ = stat_now_us;
     }
   }
 }
@@ -135,7 +168,14 @@ bool SecondaryRadioInterface::HandleReset() {
     return false;
   }
 
-  return Send(response) == RequestResult::Success;
+  const auto result = Send(response);
+  if (result != RequestResult::Success) {
+    ++tx_send_fail_count_;
+    RecordSendFailure(tx.type);
+    return false;
+  }
+  RecordTx(tx);
+  return true;
 }
 
 bool SecondaryRadioInterface::ApplyCoordinatorRequest(const MacFrame& request) {
@@ -228,6 +268,70 @@ void SecondaryRadioInterface::LogPeerTx(const MacFrame& tx) {
        tx.pending,
        tx.arg,
        tx.payload.size());
+}
+
+
+void SecondaryRadioInterface::RecordRx(const MacFrame& rx) {
+  switch (rx.type) {
+    case FrameType::Pending:
+      ++rx_pending_count_;
+      break;
+    case FrameType::Grant:
+      ++rx_grant_count_;
+      break;
+    case FrameType::Data:
+      ++rx_data_count_;
+      break;
+    case FrameType::Ack:
+      ++rx_ack_count_;
+      break;
+    case FrameType::Reset:
+      ++rx_reset_count_;
+      break;
+    default:
+      break;
+  }
+}
+
+void SecondaryRadioInterface::RecordTx(const MacFrame& tx) {
+  switch (tx.type) {
+    case FrameType::Pending:
+      ++tx_pending_count_;
+      break;
+    case FrameType::Data:
+      ++tx_data_count_;
+      break;
+    case FrameType::Ack:
+      ++tx_ack_count_;
+      break;
+    case FrameType::Reset:
+      ++tx_reset_count_;
+      break;
+    default:
+      break;
+  }
+}
+
+void SecondaryRadioInterface::RecordSendFailure(FrameType frame_type) {
+  switch (frame_type) {
+    case FrameType::Pending:
+      ++tx_send_fail_pending_count_;
+      break;
+    case FrameType::Grant:
+      ++tx_send_fail_grant_count_;
+      break;
+    case FrameType::Data:
+      ++tx_send_fail_data_count_;
+      break;
+    case FrameType::Ack:
+      ++tx_send_fail_ack_count_;
+      break;
+    case FrameType::Reset:
+      ++tx_send_fail_reset_count_;
+      break;
+    default:
+      break;
+  }
 }
 
 }  // namespace nerfnet

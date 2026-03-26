@@ -71,6 +71,11 @@ private:
   uint64_t rx_pending_count_ = 0;
   uint64_t rx_data_count_ = 0;
   uint64_t tx_send_fail_count_ = 0;
+  uint64_t tx_send_fail_pending_count_ = 0;
+  uint64_t tx_send_fail_grant_count_ = 0;
+  uint64_t tx_send_fail_data_count_ = 0;
+  uint64_t tx_send_fail_ack_count_ = 0;
+  uint64_t tx_send_fail_reset_count_ = 0;
   uint64_t rx_timeout_count_ = 0;
 
   const uint64_t poll_interval_us_;
@@ -109,6 +114,7 @@ private:
 
   bool ChooseCoordinatorTxFrame(MacFrame& tx);
   bool ApplyPeerResponse(const MacFrame& rx);
+  void RecordSendFailure(FrameType frame_type);
 };
 
 }  // namespace nerfnet

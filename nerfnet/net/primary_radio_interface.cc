@@ -162,7 +162,8 @@ void PrimaryRadioInterface::Run() {
     if (stat_now_us - last_stat_print_us_ >= 1000000) {
       LOGI("[COORD][STAT] pend_tx=%llu grant_tx=%llu data_tx=%llu "
            "ack_rx=%llu pend_rx=%llu data_rx=%llu "
-           "send_fail=%llu rx_timeout=%llu disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
+           "send_fail=%llu sf_pend=%llu sf_grant=%llu sf_data=%llu sf_ack=%llu sf_reset=%llu "
+           "rx_timeout=%llu disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
            static_cast<unsigned long long>(tx_pending_count_),
            static_cast<unsigned long long>(tx_grant_count_),
            static_cast<unsigned long long>(tx_data_count_),
@@ -170,6 +171,11 @@ void PrimaryRadioInterface::Run() {
            static_cast<unsigned long long>(rx_pending_count_),
            static_cast<unsigned long long>(rx_data_count_),
            static_cast<unsigned long long>(tx_send_fail_count_),
+           static_cast<unsigned long long>(tx_send_fail_pending_count_),
+           static_cast<unsigned long long>(tx_send_fail_grant_count_),
+           static_cast<unsigned long long>(tx_send_fail_data_count_),
+           static_cast<unsigned long long>(tx_send_fail_ack_count_),
+           static_cast<unsigned long long>(tx_send_fail_reset_count_),
            static_cast<unsigned long long>(rx_timeout_count_),
            disconnected_ ? 1u : 0u,
            poll_fail_count_,
@@ -364,6 +370,7 @@ PrimaryRadioInterface::ExchangeResult PrimaryRadioInterface::PerformExchange() {
   auto result = Send(request);
   if (result != RequestResult::Success) {
     ++tx_send_fail_count_;
+    RecordSendFailure(tx.type);
     ++fail_log_counter_;
     if ((fail_log_counter_ % 100) == 1) {
       LOGE("[COORD] send failed");
@@ -429,6 +436,28 @@ PrimaryRadioInterface::ExchangeResult PrimaryRadioInterface::PerformExchange() {
 
   return applied ? ExchangeResult::Success
                  : ExchangeResult::ProtocolFailure;
+}
+
+void PrimaryRadioInterface::RecordSendFailure(FrameType frame_type) {
+  switch (frame_type) {
+    case FrameType::Pending:
+      ++tx_send_fail_pending_count_;
+      break;
+    case FrameType::Grant:
+      ++tx_send_fail_grant_count_;
+      break;
+    case FrameType::Data:
+      ++tx_send_fail_data_count_;
+      break;
+    case FrameType::Ack:
+      ++tx_send_fail_ack_count_;
+      break;
+    case FrameType::Reset:
+      ++tx_send_fail_reset_count_;
+      break;
+    default:
+      break;
+  }
 }
 
 void PrimaryRadioInterface::HandleTransactionFailure(FailureType failure_type) {
