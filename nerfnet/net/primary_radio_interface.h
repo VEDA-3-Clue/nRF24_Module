@@ -44,6 +44,12 @@ private:
     ActiveRx,
   };
 
+  enum class FailureType {
+    Send,
+    Timeout,
+    Protocol,
+  };
+
   static constexpr uint8_t kDefaultBurstGrant = 3;
   static constexpr uint64_t kIdlePollIntervalUs = 20000;
   static constexpr uint64_t kActivePollIntervalUs = 1000;
@@ -67,6 +73,8 @@ private:
   const uint64_t poll_interval_us_;
   uint64_t current_poll_interval_us_;
   int poll_fail_count_;
+  int send_fail_streak_ = 0;
+  int timeout_fail_streak_ = 0;
 
   bool disconnected_ = false;
   uint64_t disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
@@ -84,9 +92,16 @@ private:
   uint64_t fail_log_counter_ = 0;
   uint64_t last_stat_print_us_ = 0;
 
+  enum class ExchangeResult {
+    Success,
+    SendFailure,
+    TimeoutFailure,
+    ProtocolFailure,
+  };
+
   bool ConnectionReset();
-  bool PerformExchange();
-  void HandleTransactionFailure();
+  ExchangeResult PerformExchange();
+  void HandleTransactionFailure(FailureType failure_type);
 
   bool ChooseCoordinatorTxFrame(MacFrame& tx);
   bool ApplyPeerResponse(const MacFrame& rx);

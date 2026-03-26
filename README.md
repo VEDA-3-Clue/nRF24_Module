@@ -148,3 +148,49 @@ Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
 
 이 권장값은 영상 전송을 위한 고처리량 설정이라기보다, 현재 단계에서 `send_fail` 감소와 소량 UDP/TCP 안정화에 더 초점을 둔 설정입니다.
 즉 링크 안정성에는 유리할 수 있지만, 순수 throughput 자체는 `2mbps` 대비 줄 수 있습니다.
+
+
+## 현재 실측 결과
+
+아래 수치는 현재 `1mbps + CRC16 + retry_delay 6 + retry_count 12` 설정과
+현재 MAC 구현 기준에서 측정한 결과입니다.
+
+### Ping
+
+- 기본 ping: `0% loss`, 평균 RTT 약 `198 ms`
+- `ping -s 32`: `0% loss`, 평균 RTT 약 `146 ms`
+- `ping -s 128`: `0% loss`, 평균 RTT 약 `262 ms`
+- `ping -s 256`: 약 `5% loss`, 평균 RTT 약 `313 ms`
+
+해석:
+- 작은 payload는 안정적입니다.
+- `128B`도 현재는 안정적으로 수신됩니다.
+- `256B`는 사용 가능하지만 지연과 재전송 비용이 여전히 존재합니다.
+
+### TCP 간단 검증
+
+- `nc` 기반 echo 테스트에서 `4 KiB` 수준의 데이터 왕복 확인
+- 작은 TCP interactive / 지속 전송은 가능
+- 다만 더 큰 지속 전송에서는 여전히 지연 누적 가능성 있음
+
+### UDP 실측
+
+`iperf3 -u` 기준 측정:
+
+- `64B @ 10k`: sender `0% loss`
+- `128B @ 10k`: sender `0% loss`
+- `256B @ 10k`: receiver 약 `1% loss`, jitter 약 `55 ms`
+- `256B @ 15k`: receiver `0% loss`, jitter 약 `140 ms`, receiver completion time 약 `39.7 s`
+- `256B @ 20k`: receiver 약 `1% loss`, jitter 약 `179 ms`, receiver completion time 약 `54.7 s`
+
+해석:
+- 현재 링크는 `256B`에서도 낮은 loss로 버틸 수 있습니다.
+- 하지만 bitrate를 올리면 손실보다 먼저 queue buildup 과 latency inflation 이 커집니다.
+- 현재 기준으로 `256B payload`의 안정 운용점은 대략 `10k` 부근으로 보는 것이 합리적입니다.
+
+### 현재 단계 평가
+
+- 링크 안정화와 MAC 신뢰성 확보는 상당 부분 달성됨
+- 작은 UDP/TCP는 안정화 단계에 진입
+- 현재 남은 핵심 과제는 대역폭 확대보다는 지연 감소와 처리율 개선
+- 다음 우선순위는 RF 재시도 미세조정, failure handling 보강, IRQ 검토 순서가 적절함

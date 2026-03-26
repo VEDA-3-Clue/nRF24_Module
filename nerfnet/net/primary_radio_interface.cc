@@ -93,6 +93,8 @@ void PrimaryRadioInterface::Run() {
         disconnected_ = false;
         connection_reset_required_ = false;
         poll_fail_count_ = 0;
+        send_fail_streak_ = 0;
+        timeout_fail_streak_ = 0;
         disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
         next_retry_time_us_ = 0;
         state_ = CoordinatorState::Idle;
@@ -115,12 +117,14 @@ void PrimaryRadioInterface::Run() {
           LOGE("[COORD] connection reset failed (count=%llu)",
                static_cast<unsigned long long>(reset_fail_log_counter_));
         }
-        HandleTransactionFailure();
+        HandleTransactionFailure(FailureType::Protocol);
       } else {
         LOGI("[COORD] connection reset success");
         connection_reset_required_ = false;
         state_ = CoordinatorState::Idle;
         poll_fail_count_ = 0;
+        send_fail_streak_ = 0;
+        timeout_fail_streak_ = 0;
         disconnected_ = false;
         disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
         next_retry_time_us_ = 0;
@@ -128,13 +132,24 @@ void PrimaryRadioInterface::Run() {
       continue;
     }
 
-    if (PerformExchange()) {
-      poll_fail_count_ = 0;
-      disconnected_ = false;
-      disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
-      next_retry_time_us_ = 0;
-    } else {
-      HandleTransactionFailure();
+    switch (PerformExchange()) {
+      case ExchangeResult::Success:
+        poll_fail_count_ = 0;
+        send_fail_streak_ = 0;
+        timeout_fail_streak_ = 0;
+        disconnected_ = false;
+        disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
+        next_retry_time_us_ = 0;
+        break;
+      case ExchangeResult::SendFailure:
+        HandleTransactionFailure(FailureType::Send);
+        break;
+      case ExchangeResult::TimeoutFailure:
+        HandleTransactionFailure(FailureType::Timeout);
+        break;
+      case ExchangeResult::ProtocolFailure:
+        HandleTransactionFailure(FailureType::Protocol);
+        break;
     }
 
     const uint64_t stat_now_us = TimeNowUs();
@@ -145,7 +160,7 @@ void PrimaryRadioInterface::Run() {
     if (stat_now_us - last_stat_print_us_ >= 1000000) {
       LOGI("[COORD][STAT] pend_tx=%llu grant_tx=%llu data_tx=%llu "
            "ack_rx=%llu pend_rx=%llu data_rx=%llu "
-           "send_fail=%llu rx_timeout=%llu disconnected=%u fail_streak=%d backoff_us=%llu",
+           "send_fail=%llu rx_timeout=%llu disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
            static_cast<unsigned long long>(tx_pending_count_),
            static_cast<unsigned long long>(tx_grant_count_),
            static_cast<unsigned long long>(tx_data_count_),
@@ -156,6 +171,8 @@ void PrimaryRadioInterface::Run() {
            static_cast<unsigned long long>(rx_timeout_count_),
            disconnected_ ? 1u : 0u,
            poll_fail_count_,
+           send_fail_streak_,
+           timeout_fail_streak_,
            static_cast<unsigned long long>(disconnect_backoff_us_));
 
       last_stat_print_us_ = stat_now_us;
@@ -321,15 +338,15 @@ bool PrimaryRadioInterface::ApplyPeerResponse(const MacFrame& rx) {
   }
 }
 
-bool PrimaryRadioInterface::PerformExchange() {
+PrimaryRadioInterface::ExchangeResult PrimaryRadioInterface::PerformExchange() {
   MacFrame tx;
   if (!ChooseCoordinatorTxFrame(tx)) {
-    return false;
+    return ExchangeResult::ProtocolFailure;
   }
 
   std::vector<uint8_t> request;
   if (!EncodeMacFrame(tx, request)) {
-    return false;
+    return ExchangeResult::ProtocolFailure;
   }
 
   auto result = Send(request);
@@ -339,7 +356,7 @@ bool PrimaryRadioInterface::PerformExchange() {
     if ((fail_log_counter_ % 100) == 1) {
       LOGE("[COORD] send failed");
     }
-    return false;
+    return ExchangeResult::SendFailure;
   }
 
   std::vector<uint8_t> response(kMaxPacketSize, 0x00);
@@ -350,13 +367,13 @@ bool PrimaryRadioInterface::PerformExchange() {
     if ((fail_log_counter_ % 100) == 1) {
       LOGE("[COORD] receive failed");
     }
-    return false;
+    return ExchangeResult::TimeoutFailure;
   }
 
   MacFrame rx;
   if (!DecodeMacFrame(response, rx)) {
     LOGE("[COORD] decode failed");
-    return false;
+    return ExchangeResult::ProtocolFailure;
   }
 
   bool is_idle_pair =
@@ -380,13 +397,35 @@ bool PrimaryRadioInterface::PerformExchange() {
         static_cast<int>(state_));
   }
 
-  return ApplyPeerResponse(rx);
+  return ApplyPeerResponse(rx) ? ExchangeResult::Success
+                               : ExchangeResult::ProtocolFailure;
 }
 
-void PrimaryRadioInterface::HandleTransactionFailure() {
-  ++poll_fail_count_;
+void PrimaryRadioInterface::HandleTransactionFailure(FailureType failure_type) {
+  switch (failure_type) {
+    case FailureType::Send:
+      ++send_fail_streak_;
+      timeout_fail_streak_ = 0;
+      break;
+    case FailureType::Timeout:
+      ++timeout_fail_streak_;
+      send_fail_streak_ = 0;
+      break;
+    case FailureType::Protocol:
+      ++send_fail_streak_;
+      ++timeout_fail_streak_;
+      break;
+  }
 
-  if (poll_fail_count_ >= kDisconnectFailureThreshold) {
+  const int combined_fail_streak = send_fail_streak_ + timeout_fail_streak_;
+  poll_fail_count_ = combined_fail_streak;
+
+  const bool disconnect_now =
+      send_fail_streak_ >= kDisconnectFailureThreshold ||
+      timeout_fail_streak_ >= (kDisconnectFailureThreshold + 2) ||
+      combined_fail_streak >= (kDisconnectFailureThreshold + 3);
+
+  if (disconnect_now) {
     disconnected_ = true;
     connection_reset_required_ = true;
     state_ = CoordinatorState::ResetSync;
