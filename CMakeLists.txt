@@ -10,7 +10,7 @@ cmake_minimum_required(VERSION 3.16)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-project(nerfnet VERSION 0.1.6 LANGUAGES CXX)
+project(nerfnet VERSION 0.1.7 LANGUAGES CXX)
 
 set(CMAKE_INSTALL_PREFIX "${CMAKE_SOURCE_DIR}/install_pack" CACHE PATH "Default install path" FORCE)
 

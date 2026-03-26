@@ -31,7 +31,8 @@ public:
                         uint32_t primary_addr,
                         uint32_t secondary_addr,
                         uint8_t channel,
-                        uint64_t poll_interval_us);
+                        uint64_t poll_interval_us,
+                        const RadioConfig& radio_config);
 
   void Run();
 

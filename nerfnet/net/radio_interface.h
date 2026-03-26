@@ -34,11 +34,20 @@ namespace nerfnet {
 // Common MAC/radio interface used by both coordinator and peer.
 class RadioInterface : public NonCopyable {
  public:
+  struct RadioConfig {
+    rf24_pa_dbm_e pa_level = RF24_PA_MAX;
+    rf24_datarate_e data_rate = RF24_2MBPS;
+    rf24_crclength_e crc_length = RF24_CRC_8;
+    uint8_t retry_delay = 0;
+    uint8_t retry_count = 15;
+  };
+
   RadioInterface(uint16_t ce_pin,
                  int tunnel_fd,
                  uint32_t primary_addr,
                  uint32_t secondary_addr,
-                 uint8_t channel);
+                 uint8_t channel,
+                 const RadioConfig& radio_config);
   virtual ~RadioInterface();
 
   enum class RequestResult {
@@ -82,9 +91,10 @@ class RadioInterface : public NonCopyable {
   const int tunnel_fd_;
   const uint32_t primary_addr_;
   const uint32_t secondary_addr_;
+  const RadioConfig radio_config_;
 
-  std::thread tunnel_thread_;
   std::atomic<bool> running_;
+  std::thread tunnel_thread_;
 
   std::mutex read_buffer_mutex_;
   std::deque<std::vector<uint8_t>> read_buffer_;

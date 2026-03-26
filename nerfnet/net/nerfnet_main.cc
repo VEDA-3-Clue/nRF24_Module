@@ -30,6 +30,38 @@
 #include "nerfnet/net/secondary_radio_interface.h"
 #include "nerfnet/util/log.h"
 
+namespace {
+
+bool ParseDataRate(const std::string& value, rf24_datarate_e& data_rate) {
+  if (value == "2mbps") {
+    data_rate = RF24_2MBPS;
+    return true;
+  }
+  if (value == "1mbps") {
+    data_rate = RF24_1MBPS;
+    return true;
+  }
+  if (value == "250kbps") {
+    data_rate = RF24_250KBPS;
+    return true;
+  }
+  return false;
+}
+
+bool ParseCrcLength(const std::string& value, rf24_crclength_e& crc_length) {
+  if (value == "8") {
+    crc_length = RF24_CRC_8;
+    return true;
+  }
+  if (value == "16") {
+    crc_length = RF24_CRC_16;
+    return true;
+  }
+  return false;
+}
+
+}  // namespace
+
 // A description of the program.
 constexpr char kDescription[] =
     "A tool for creating a network tunnel over cheap NRF24L01 radios.";
@@ -125,7 +157,31 @@ int main(int argc, char** argv) {
       false, 100, "microseconds", cmd);
   TCLAP::SwitchArg enable_tunnel_logs_arg("", "enable_tunnel_logs",
       "Set to enable verbose logs for read/writes from the tunnel.", cmd);
+  TCLAP::ValueArg<std::string> rf_data_rate_arg("", "rf_data_rate",
+      "NRF24 data rate: 250kbps, 1mbps, or 2mbps.", false, "2mbps", "rate",
+      cmd);
+  TCLAP::ValueArg<std::string> rf_crc_arg("", "rf_crc",
+      "NRF24 CRC length: 8 or 16.", false, "8", "bits", cmd);
+  TCLAP::ValueArg<unsigned int> rf_retry_delay_arg("", "rf_retry_delay",
+      "NRF24 auto-retry delay (0-15 => 250us to 4000us).", false, 0,
+      "ticks", cmd);
+  TCLAP::ValueArg<unsigned int> rf_retry_count_arg("", "rf_retry_count",
+      "NRF24 auto-retry count (0-15).", false, 15, "count", cmd);
   cmd.parse(argc, argv);
+
+  nerfnet::RadioInterface::RadioConfig radio_config;
+  CHECK(ParseDataRate(rf_data_rate_arg.getValue(), radio_config.data_rate),
+      "Invalid --rf_data_rate '%s' (expected 250kbps, 1mbps, or 2mbps)",
+      rf_data_rate_arg.getValue().c_str());
+  CHECK(ParseCrcLength(rf_crc_arg.getValue(), radio_config.crc_length),
+      "Invalid --rf_crc '%s' (expected 8 or 16)",
+      rf_crc_arg.getValue().c_str());
+  CHECK(rf_retry_delay_arg.getValue() <= 15,
+      "--rf_retry_delay must be between 0 and 15");
+  CHECK(rf_retry_count_arg.getValue() <= 15,
+      "--rf_retry_count must be between 0 and 15");
+  radio_config.retry_delay = static_cast<uint8_t>(rf_retry_delay_arg.getValue());
+  radio_config.retry_count = static_cast<uint8_t>(rf_retry_count_arg.getValue());
 
   std::string tunnel_ip = tunnel_ip_arg.getValue();
   if (!tunnel_ip_arg.isSet()) {
@@ -151,14 +207,14 @@ int main(int argc, char** argv) {
     nerfnet::PrimaryRadioInterface radio_interface(
         ce_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-        channel_arg.getValue(), poll_interval_us_arg.getValue());
+        channel_arg.getValue(), poll_interval_us_arg.getValue(), radio_config);
     radio_interface.SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
     radio_interface.Run();
   } else if (secondary_arg.getValue()) {
     nerfnet::SecondaryRadioInterface radio_interface(
         ce_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-        channel_arg.getValue());
+        channel_arg.getValue(), radio_config);
     radio_interface.SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
     radio_interface.Run();
   } else {

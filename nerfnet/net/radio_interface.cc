@@ -31,12 +31,13 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
                                int tunnel_fd,
                                uint32_t primary_addr,
                                uint32_t secondary_addr,
-                               uint8_t channel)
+                               uint8_t channel,
+                               const RadioConfig& radio_config)
     : radio_(ce_pin, 0),
       tunnel_fd_(tunnel_fd),
       primary_addr_(primary_addr),
       secondary_addr_(secondary_addr),
-      tunnel_thread_(&RadioInterface::TunnelThread, this),
+      radio_config_(radio_config),
       running_(true),
       next_tx_seq_(1),
       tx_in_flight_(false),
@@ -46,13 +47,15 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
   CHECK(channel < 128, "Channel must be between 0 and 127");
   CHECK(radio_.begin(), "Failed to start NRF24L01");
   radio_.setChannel(channel);
-  radio_.setPALevel(RF24_PA_MAX);
-  radio_.setDataRate(RF24_2MBPS);
+  radio_.setPALevel(radio_config_.pa_level);
+  radio_.setDataRate(radio_config_.data_rate);
   radio_.setAddressWidth(3);
   radio_.setAutoAck(1);
-  radio_.setRetries(0, 15);
-  radio_.setCRCLength(RF24_CRC_8);
+  radio_.setRetries(radio_config_.retry_delay, radio_config_.retry_count);
+  radio_.setCRCLength(radio_config_.crc_length);
   CHECK(radio_.isChipConnected(), "NRF24L01 is unavailable");
+
+  tunnel_thread_ = std::thread(&RadioInterface::TunnelThread, this);
 }
 
 RadioInterface::~RadioInterface() {
@@ -153,9 +156,15 @@ void RadioInterface::TunnelThread() {
       continue;
     }
 
+    std::vector<uint8_t> packet(&buffer[0], &buffer[bytes_read]);
+    if (!IsValidIpPacket(packet)) {
+      LOGE("Dropping non-IP or malformed tunnel packet len=%d", bytes_read);
+      continue;
+    }
+
     {
       std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-      read_buffer_.emplace_back(&buffer[0], &buffer[bytes_read]);
+      read_buffer_.push_back(std::move(packet));
       if (tunnel_logs_enabled_) {
         LOGI("Read %zu bytes from tunnel", read_buffer_.back().size());
       }
@@ -362,7 +371,6 @@ void RadioInterface::WriteTunnel() {
   if (!IsValidIpPacket(frame_buffer_)) {
     LOGE("Dropping invalid reassembled IP packet len=%zu", frame_buffer_.size());
     frame_buffer_.clear();
-    last_rx_seq_.reset();
     return;
   }
 
@@ -373,7 +381,6 @@ void RadioInterface::WriteTunnel() {
 
   if (bytes_written < 0) {
     LOGE("Failed to write to tunnel %s (%d)", strerror(errno), errno);
-    last_rx_seq_.reset();
   }
 }
 

@@ -27,7 +27,8 @@ class SecondaryRadioInterface : public RadioInterface {
                           int tunnel_fd,
                           uint32_t primary_addr,
                           uint32_t secondary_addr,
-                          uint8_t channel);
+                          uint8_t channel,
+                          const RadioConfig& radio_config);
 
   void Run();
 

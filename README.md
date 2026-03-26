@@ -84,3 +84,67 @@ Peer 역시 `PENDING`을 통해 자신에게 전송할 데이터가 있음을 �
 `cmake --preset aarch64-release`
 `cmake --build --preset aarch64-release`
 `cpack --preset aarch64-release`
+
+## 실행 방법
+
+Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
+특히 `--channel`, `--primary_addr`, `--secondary_addr`, 그리고 RF 튜닝 옵션은 반드시 양 끝단이 일치해야 합니다.
+
+### Coordinator 실행 예시
+
+```bash
+./build/aarch64-release/nerfnet/nerfnet \
+  --primary \
+  --interface_name nerf0 \
+  --tunnel_ip 192.168.10.1 \
+  --tunnel_mask 255.255.255.0 \
+  --channel 1 \
+  --poll_interval_us 100
+```
+
+### Peer 실행 예시
+
+```bash
+./build/aarch64-release/nerfnet/nerfnet \
+  --secondary \
+  --interface_name nerf0 \
+  --tunnel_ip 192.168.10.2 \
+  --tunnel_mask 255.255.255.0 \
+  --channel 1
+```
+
+### RF 튜닝 옵션
+
+다음 옵션으로 nRF24 링크 파라미터를 실행 시점에 조정할 수 있습니다.
+
+- `--rf_data_rate {250kbps|1mbps|2mbps}`
+- `--rf_crc {8|16}`
+- `--rf_retry_delay {0..15}`
+- `--rf_retry_count {0..15}`
+
+`--rf_retry_delay` 는 RF24 기준 1 step = 250us 이며, 실제 auto-retry delay는 250us ~ 4000us 범위입니다.
+
+현재 1차 권장 실험값은 아래와 같습니다.
+
+- `--rf_data_rate 1mbps`
+- `--rf_crc 16`
+- `--rf_retry_delay 6`
+- `--rf_retry_count 12`
+
+예시:
+
+```bash
+./build/aarch64-release/nerfnet/nerfnet \
+  --primary \
+  --interface_name nerf0 \
+  --tunnel_ip 192.168.10.1 \
+  --channel 1 \
+  --poll_interval_us 100 \
+  --rf_data_rate 1mbps \
+  --rf_crc 16 \
+  --rf_retry_delay 6 \
+  --rf_retry_count 12
+```
+
+이 권장값은 영상 전송을 위한 고처리량 설정이라기보다, 현재 단계에서 `send_fail` 감소와 소량 UDP/TCP 안정화에 더 초점을 둔 설정입니다.
+즉 링크 안정성에는 유리할 수 있지만, 순수 throughput 자체는 `2mbps` 대비 줄 수 있습니다.
