@@ -128,11 +128,13 @@ sudo ./run.sh --secondary --ce_pin 25
 선택적으로 nRF24L01 의 `IRQ` 핀을 보드 GPIO 에 연결한 뒤 `--irq_pin` 으로 지정할 수 있습니다.
 이 옵션을 주면 RX 대기 구간에서 GPIO interrupt 를 사용하고, 주지 않으면 기존 polling 방식으로 동작합니다.
 
-`--irq_pin` 은 이제 아래 두 형식을 모두 받습니다.
-- sysfs global GPIO 번호 예: `518`
-- GPIO line offset 예: `6`
+`--irq_pin` 은 이제 GPIO line offset 기준 사용을 권장합니다.
+기존 sysfs global GPIO 번호도 호환 차원에서 계속 받을 수 있습니다.
 
-예를 들어 Raspberry Pi 에서 physical pin 31 = GPIO 6 인 경우 아래처럼 offset 기준으로 실행할 수 있습니다.
+- 권장: GPIO line offset 예 `6`
+- 호환: sysfs global GPIO 번호 예 `518`
+
+예를 들어 Raspberry Pi 에서 physical pin 31 = GPIO 6 인 경우 아래처럼 실행할 수 있습니다.
 
 ```bash
 sudo ./run.sh --primary --ce_pin 25 --irq_pin 6

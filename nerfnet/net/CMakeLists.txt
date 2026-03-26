@@ -1,3 +1,6 @@
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(LIBGPIOD REQUIRED libgpiod)
+
 ################################################################################
 #
 # net build
@@ -15,6 +18,7 @@ add_executable(nerfnet
 
 target_include_directories(nerfnet PRIVATE
   ${tclap_INCLUDE_DIRS}
+  ${LIBGPIOD_INCLUDE_DIRS}
 )
 
 target_include_directories(nerfnet PUBLIC
@@ -25,6 +29,7 @@ target_link_libraries(nerfnet PUBLIC
   pthread
   rf24
   util
+  ${LIBGPIOD_LIBRARIES}
 )
 
 install(TARGETS nerfnet DESTINATION bin)

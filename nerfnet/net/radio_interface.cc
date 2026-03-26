@@ -17,8 +17,7 @@
 #include "nerfnet/net/radio_interface.h"
 
 #include <errno.h>
-#include <fcntl.h>
-#include <poll.h>
+#include <gpiod.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -35,6 +34,13 @@
 namespace nerfnet {
 
 namespace {
+
+struct ResolvedIrqTarget {
+  std::string chip_name;
+  std::string chip_label;
+  unsigned int line_offset = 0;
+  int global_gpio = -1;
+};
 
 std::optional<int> ReadIntFile(const std::string& path) {
   std::ifstream stream(path);
@@ -67,6 +73,129 @@ bool IsPreferredGpioChipLabel(const std::string& label) {
          lower.find("gpio") != std::string::npos;
 }
 
+std::optional<std::string> FindChipNameByLabelAndLines(const std::string& label,
+                                                       unsigned int num_lines) {
+  gpiod_chip_iter* iter = gpiod_chip_iter_new();
+  if (iter == nullptr) {
+    return std::nullopt;
+  }
+
+  std::optional<std::string> fallback;
+  gpiod_chip* chip = nullptr;
+  gpiod_foreach_chip(iter, chip) {
+    const char* chip_name = gpiod_chip_name(chip);
+    const char* chip_label = gpiod_chip_label(chip);
+    const unsigned int chip_lines = gpiod_chip_num_lines(chip);
+    if (chip_name == nullptr) {
+      continue;
+    }
+
+    if (chip_label != nullptr && label == chip_label && chip_lines == num_lines) {
+      std::string result = chip_name;
+      gpiod_chip_iter_free(iter);
+      return result;
+    }
+
+    if (chip_label != nullptr && label == chip_label && !fallback.has_value()) {
+      fallback = std::string(chip_name);
+    }
+  }
+
+  gpiod_chip_iter_free(iter);
+  return fallback;
+}
+
+std::optional<ResolvedIrqTarget> ResolveIrqTargetFromGlobal(int global_gpio) {
+  for (const auto& entry : std::filesystem::directory_iterator("/sys/class/gpio")) {
+    if (!entry.is_directory()) {
+      continue;
+    }
+
+    const std::string name = entry.path().filename().string();
+    if (name.rfind("gpiochip", 0) != 0) {
+      continue;
+    }
+
+    const auto base = ReadIntFile((entry.path() / "base").string());
+    const auto ngpio = ReadIntFile((entry.path() / "ngpio").string());
+    if (!base.has_value() || !ngpio.has_value()) {
+      continue;
+    }
+
+    if (global_gpio < *base || global_gpio >= (*base + *ngpio)) {
+      continue;
+    }
+
+    const std::string label = ReadTextFile((entry.path() / "label").string());
+    const auto chip_name = FindChipNameByLabelAndLines(label, static_cast<unsigned int>(*ngpio));
+    if (!chip_name.has_value()) {
+      continue;
+    }
+
+    ResolvedIrqTarget target;
+    target.chip_name = *chip_name;
+    target.chip_label = label;
+    target.line_offset = static_cast<unsigned int>(global_gpio - *base);
+    target.global_gpio = global_gpio;
+    return target;
+  }
+
+  return std::nullopt;
+}
+
+std::optional<ResolvedIrqTarget> ResolveIrqTargetFromOffset(int line_offset) {
+  gpiod_chip_iter* iter = gpiod_chip_iter_new();
+  if (iter == nullptr) {
+    return std::nullopt;
+  }
+
+  std::optional<ResolvedIrqTarget> fallback;
+  gpiod_chip* chip = nullptr;
+  gpiod_foreach_chip(iter, chip) {
+    const unsigned int chip_lines = gpiod_chip_num_lines(chip);
+    if (line_offset < 0 || static_cast<unsigned int>(line_offset) >= chip_lines) {
+      continue;
+    }
+
+    const char* chip_name = gpiod_chip_name(chip);
+    if (chip_name == nullptr) {
+      continue;
+    }
+
+    ResolvedIrqTarget target;
+    target.chip_name = chip_name;
+    const char* chip_label = gpiod_chip_label(chip);
+    if (chip_label != nullptr) {
+      target.chip_label = chip_label;
+    }
+    target.line_offset = static_cast<unsigned int>(line_offset);
+
+    if (IsPreferredGpioChipLabel(target.chip_label)) {
+      gpiod_chip_iter_free(iter);
+      return target;
+    }
+
+    if (!fallback.has_value()) {
+      fallback = target;
+    }
+  }
+
+  gpiod_chip_iter_free(iter);
+  return fallback;
+}
+
+std::optional<ResolvedIrqTarget> ResolveIrqTarget(int irq_pin) {
+  if (irq_pin < 0) {
+    return std::nullopt;
+  }
+
+  if (const auto global_target = ResolveIrqTargetFromGlobal(irq_pin); global_target.has_value()) {
+    return global_target;
+  }
+
+  return ResolveIrqTargetFromOffset(irq_pin);
+}
+
 }  // namespace
 
 RadioInterface::RadioInterface(uint16_t ce_pin,
@@ -88,8 +217,10 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
       tx_inflight_bytes_left_(0),
       tunnel_logs_enabled_(false),
       irq_pin_(irq_pin),
-      irq_fd_(-1),
-      resolved_irq_gpio_(-1) {
+      irq_chip_(nullptr),
+      irq_line_(nullptr),
+      resolved_irq_line_offset_(0),
+      resolved_irq_global_gpio_(-1) {
   CHECK(channel < 128, "Channel must be between 0 and 127");
   CHECK(radio_.begin(), "Failed to start NRF24L01");
   radio_.setChannel(channel);
@@ -101,7 +232,7 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
   radio_.setCRCLength(radio_config_.crc_length);
   CHECK(radio_.isChipConnected(), "NRF24L01 is unavailable");
   if (irq_pin_ >= 0 && !InitializeIrq()) {
-    LOGE("Falling back to RX polling because IRQ setup failed for GPIO %d", irq_pin_);
+    LOGE("Falling back to RX polling because IRQ setup failed for pin %d", irq_pin_);
   }
 
   tunnel_thread_ = std::thread(&RadioInterface::TunnelThread, this);
@@ -115,132 +246,84 @@ RadioInterface::~RadioInterface() {
   CleanupIrq();
 }
 
-bool RadioInterface::WriteSysfsFile(const std::string& path, const std::string& value) {
-  const int fd = open(path.c_str(), O_WRONLY);
-  if (fd < 0) {
-    return false;
-  }
-
-  const ssize_t bytes_written = write(fd, value.data(), value.size());
-  close(fd);
-  return bytes_written == static_cast<ssize_t>(value.size());
-}
-
-bool RadioInterface::ExportIrqGpio(int gpio) {
-  errno = 0;
-  return WriteSysfsFile("/sys/class/gpio/export", std::to_string(gpio)) || errno == EBUSY;
-}
-
-std::optional<int> RadioInterface::ResolveIrqGpio() const {
-  if (irq_pin_ < 0) {
-    return std::nullopt;
-  }
-
-  std::optional<int> fallback;
-  for (const auto& entry : std::filesystem::directory_iterator("/sys/class/gpio")) {
-    if (!entry.is_directory()) {
-      continue;
-    }
-
-    const std::string name = entry.path().filename().string();
-    if (name.rfind("gpiochip", 0) != 0) {
-      continue;
-    }
-
-    const auto base = ReadIntFile((entry.path() / "base").string());
-    const auto ngpio = ReadIntFile((entry.path() / "ngpio").string());
-    if (!base.has_value() || !ngpio.has_value()) {
-      continue;
-    }
-
-    if (irq_pin_ < 0 || irq_pin_ >= *ngpio) {
-      continue;
-    }
-
-    const int resolved = *base + irq_pin_;
-    const std::string label = ReadTextFile((entry.path() / "label").string());
-    if (IsPreferredGpioChipLabel(label)) {
-      LOGI("Resolved IRQ line offset %d to sysfs GPIO %d via %s",
-           irq_pin_,
-           resolved,
-           name.c_str());
-      return resolved;
-    }
-
-    if (!fallback.has_value()) {
-      fallback = resolved;
-    }
-  }
-
-  if (fallback.has_value()) {
-    LOGI("Resolved IRQ line offset %d to sysfs GPIO %d", irq_pin_, *fallback);
-  }
-  return fallback;
-}
-
 bool RadioInterface::InitializeIrq() {
   if (irq_pin_ < 0) {
     return false;
   }
 
-  int gpio = irq_pin_;
-  if (!ExportIrqGpio(gpio)) {
-    const auto resolved = ResolveIrqGpio();
-    if (!resolved.has_value()) {
-      LOGE("Failed to export IRQ GPIO %d: %s (%d)", irq_pin_, strerror(errno), errno);
-      return false;
-    }
-
-    gpio = *resolved;
-    if (!ExportIrqGpio(gpio)) {
-      LOGE("Failed to export resolved IRQ GPIO %d for requested pin %d: %s (%d)",
-           gpio,
-           irq_pin_,
-           strerror(errno),
-           errno);
-      return false;
-    }
-  }
-
-  resolved_irq_gpio_ = gpio;
-  const std::string gpio_dir = "/sys/class/gpio/gpio" + std::to_string(resolved_irq_gpio_);
-  if (!WriteSysfsFile(gpio_dir + "/direction", "in")) {
-    LOGE("Failed to set IRQ GPIO %d direction", resolved_irq_gpio_);
-    return false;
-  }
-  if (!WriteSysfsFile(gpio_dir + "/edge", "falling")) {
-    LOGE("Failed to set IRQ GPIO %d edge", resolved_irq_gpio_);
+  const auto target = ResolveIrqTarget(irq_pin_);
+  if (!target.has_value()) {
+    LOGE("Failed to resolve IRQ pin %d to a gpiochip line", irq_pin_);
     return false;
   }
 
-  irq_fd_ = open((gpio_dir + "/value").c_str(), O_RDONLY | O_NONBLOCK);
-  if (irq_fd_ < 0) {
-    LOGE("Failed to open IRQ GPIO %d value: %s (%d)", resolved_irq_gpio_, strerror(errno), errno);
+  irq_chip_ = gpiod_chip_open_by_name(target->chip_name.c_str());
+  if (irq_chip_ == nullptr) {
+    LOGE("Failed to open gpiochip %s for IRQ pin %d: %s (%d)",
+         target->chip_name.c_str(),
+         irq_pin_,
+         strerror(errno),
+         errno);
     return false;
   }
 
-  char value = 0;
-  lseek(irq_fd_, 0, SEEK_SET);
-  const ssize_t initial_read = read(irq_fd_, &value, 1);
-  (void)initial_read;
-  LOGI("RX IRQ enabled on GPIO %d (requested %d)", resolved_irq_gpio_, irq_pin_);
+  irq_line_ = gpiod_chip_get_line(irq_chip_, target->line_offset);
+  if (irq_line_ == nullptr) {
+    LOGE("Failed to get gpiochip line %u on %s for IRQ pin %d: %s (%d)",
+         target->line_offset,
+         target->chip_name.c_str(),
+         irq_pin_,
+         strerror(errno),
+         errno);
+    CleanupIrq();
+    return false;
+  }
+
+  if (gpiod_line_request_falling_edge_events(irq_line_, "nerfnet-rx-irq") < 0) {
+    LOGE("Failed to request falling-edge IRQ events on %s line %u: %s (%d)",
+         target->chip_name.c_str(),
+         target->line_offset,
+         strerror(errno),
+         errno);
+    CleanupIrq();
+    return false;
+  }
+
+  resolved_irq_chip_name_ = target->chip_name;
+  resolved_irq_line_offset_ = target->line_offset;
+  resolved_irq_global_gpio_ = target->global_gpio;
+
+  if (resolved_irq_global_gpio_ >= 0) {
+    LOGI("RX IRQ enabled on %s line %u (requested %d, global GPIO %d)",
+         resolved_irq_chip_name_.c_str(),
+         resolved_irq_line_offset_,
+         irq_pin_,
+         resolved_irq_global_gpio_);
+  } else {
+    LOGI("RX IRQ enabled on %s line %u (requested %d)",
+         resolved_irq_chip_name_.c_str(),
+         resolved_irq_line_offset_,
+         irq_pin_);
+  }
   return true;
 }
 
 void RadioInterface::CleanupIrq() {
-  if (irq_fd_ >= 0) {
-    close(irq_fd_);
-    irq_fd_ = -1;
+  if (irq_line_ != nullptr) {
+    gpiod_line_release(irq_line_);
+    irq_line_ = nullptr;
   }
-
-  if (resolved_irq_gpio_ >= 0) {
-    WriteSysfsFile("/sys/class/gpio/unexport", std::to_string(resolved_irq_gpio_));
-    resolved_irq_gpio_ = -1;
+  if (irq_chip_ != nullptr) {
+    gpiod_chip_close(irq_chip_);
+    irq_chip_ = nullptr;
   }
+  resolved_irq_chip_name_.clear();
+  resolved_irq_line_offset_ = 0;
+  resolved_irq_global_gpio_ = -1;
 }
 
 RadioInterface::RequestResult RadioInterface::WaitForRxReady(uint64_t timeout_us) {
-  if (irq_fd_ < 0) {
+  if (irq_line_ == nullptr) {
     const uint64_t start_us = TimeNowUs();
     while (!radio_.available()) {
       if (timeout_us != 0 && (start_us + timeout_us) < TimeNowUs()) {
@@ -254,11 +337,8 @@ RadioInterface::RequestResult RadioInterface::WaitForRxReady(uint64_t timeout_us
 
   const uint64_t deadline_us = timeout_us == 0 ? 0 : (TimeNowUs() + timeout_us);
   while (!radio_.available()) {
-    struct pollfd pfd = {};
-    pfd.fd = irq_fd_;
-    pfd.events = POLLPRI | POLLERR;
-
-    int timeout_ms = -1;
+    std::timespec timeout = {};
+    std::timespec* timeout_ptr = nullptr;
     if (deadline_us != 0) {
       const uint64_t now_us = TimeNowUs();
       if (now_us >= deadline_us) {
@@ -266,34 +346,41 @@ RadioInterface::RequestResult RadioInterface::WaitForRxReady(uint64_t timeout_us
         return RequestResult::Timeout;
       }
       const uint64_t remaining_us = deadline_us - now_us;
-      timeout_ms = static_cast<int>((remaining_us + 999) / 1000);
-      if (timeout_ms == 0) {
-        timeout_ms = 1;
-      }
+      timeout.tv_sec = static_cast<time_t>(remaining_us / 1000000);
+      timeout.tv_nsec = static_cast<long>((remaining_us % 1000000) * 1000);
+      timeout_ptr = &timeout;
     }
 
-    char value = 0;
-    lseek(irq_fd_, 0, SEEK_SET);
-    const ssize_t clear_before_poll = read(irq_fd_, &value, 1);
-    (void)clear_before_poll;
-
-    const int poll_result = poll(&pfd, 1, timeout_ms);
-    if (poll_result < 0) {
+    const int wait_result = gpiod_line_event_wait(irq_line_, timeout_ptr);
+    if (wait_result < 0) {
       if (errno == EINTR) {
         continue;
       }
-      LOGE("IRQ poll failed: %s (%d)", strerror(errno), errno);
+      LOGE("IRQ wait failed on %s line %u: %s (%d)",
+           resolved_irq_chip_name_.c_str(),
+           resolved_irq_line_offset_,
+           strerror(errno),
+           errno);
       return RequestResult::Timeout;
     }
 
-    if (poll_result == 0) {
+    if (wait_result == 0) {
       LOGE("Timeout receiving response");
       return RequestResult::Timeout;
     }
 
-    lseek(irq_fd_, 0, SEEK_SET);
-    const ssize_t clear_after_poll = read(irq_fd_, &value, 1);
-    (void)clear_after_poll;
+    gpiod_line_event event = {};
+    if (gpiod_line_event_read(irq_line_, &event) < 0) {
+      if (errno == EINTR) {
+        continue;
+      }
+      LOGE("Failed to read IRQ event on %s line %u: %s (%d)",
+           resolved_irq_chip_name_.c_str(),
+           resolved_irq_line_offset_,
+           strerror(errno),
+           errno);
+      return RequestResult::Timeout;
+    }
   }
 
   return RequestResult::Success;

@@ -134,7 +134,7 @@ int main(int argc, char** argv) {
       "Set to the index of the NRF24L01 chip-enable pin.", false, 22, "index",
       cmd);
   TCLAP::ValueArg<int> irq_pin_arg("", "irq_pin",
-      "Optional IRQ GPIO. Accepts either a sysfs global GPIO number or a line offset such as BCM GPIO 6.", false, -1, "index",
+      "Optional IRQ line. Prefer a line offset such as BCM GPIO 6; sysfs global GPIO numbers are still accepted for compatibility.", false, -1, "index",
       cmd);
   TCLAP::SwitchArg primary_arg("", "primary",
       "Run this side of the network in primary mode.", false);

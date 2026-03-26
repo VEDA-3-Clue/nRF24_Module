@@ -30,6 +30,9 @@
 
 #include "nerfnet/util/non_copyable.h"
 
+struct gpiod_chip;
+struct gpiod_line;
+
 namespace nerfnet {
 
 // Common MAC/radio interface used by both coordinator and peer.
@@ -114,8 +117,11 @@ class RadioInterface : public NonCopyable {
 
   bool tunnel_logs_enabled_;
   const int irq_pin_;
-  int irq_fd_;
-  int resolved_irq_gpio_;
+  gpiod_chip* irq_chip_;
+  gpiod_line* irq_line_;
+  std::string resolved_irq_chip_name_;
+  unsigned int resolved_irq_line_offset_;
+  int resolved_irq_global_gpio_;
 
   RequestResult Send(const std::vector<uint8_t>& request);
   RequestResult Receive(std::vector<uint8_t>& response, uint64_t timeout_us = 0);
@@ -152,9 +158,6 @@ class RadioInterface : public NonCopyable {
   bool InitializeIrq();
   void CleanupIrq();
   RequestResult WaitForRxReady(uint64_t timeout_us);
-  bool WriteSysfsFile(const std::string& path, const std::string& value);
-  bool ExportIrqGpio(int gpio);
-  std::optional<int> ResolveIrqGpio() const;
 };
 
 }  // namespace nerfnet
