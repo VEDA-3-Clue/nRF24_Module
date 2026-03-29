@@ -25,6 +25,7 @@
 namespace nerfnet {
 
 PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
+                                             uint16_t csn_pin,
                                              int tunnel_fd,
                                              uint32_t primary_addr,
                                              uint32_t secondary_addr,
@@ -33,6 +34,7 @@ PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
                                              const RadioConfig& radio_config,
                                              int irq_pin)
     : RadioInterface(ce_pin,
+                     csn_pin,
                      tunnel_fd,
                      primary_addr,
                      secondary_addr,

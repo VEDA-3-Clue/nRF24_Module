@@ -27,6 +27,7 @@ namespace nerfnet {
 class PrimaryRadioInterface : public RadioInterface {
 public:
   PrimaryRadioInterface(uint16_t ce_pin,
+                        uint16_t csn_pin,
                         int tunnel_fd,
                         uint32_t primary_addr,
                         uint32_t secondary_addr,

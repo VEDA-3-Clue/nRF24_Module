@@ -199,13 +199,16 @@ std::optional<ResolvedIrqTarget> ResolveIrqTarget(int irq_pin) {
 }  // namespace
 
 RadioInterface::RadioInterface(uint16_t ce_pin,
+                               uint16_t csn_pin,
                                int tunnel_fd,
                                uint32_t primary_addr,
                                uint32_t secondary_addr,
                                uint8_t channel,
                                const RadioConfig& radio_config,
                                int irq_pin)
-    : radio_(ce_pin, 0),
+    : radio_(ce_pin, csn_pin),
+      ce_pin_(ce_pin),
+      csn_pin_(csn_pin),
       tunnel_fd_(tunnel_fd),
       primary_addr_(primary_addr),
       secondary_addr_(secondary_addr),
@@ -222,7 +225,9 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
       resolved_irq_line_offset_(0),
       resolved_irq_global_gpio_(-1) {
   CHECK(channel < 128, "Channel must be between 0 and 127");
-  CHECK(radio_.begin(), "Failed to start NRF24L01");
+  CHECK(radio_.begin(), "Failed to start NRF24L01 (ce=%u csn=%u)",
+      static_cast<unsigned>(ce_pin_),
+      static_cast<unsigned>(csn_pin_));
   radio_.setChannel(channel);
   radio_.setPALevel(radio_config_.pa_level);
   radio_.setDataRate(radio_config_.data_rate);
@@ -230,7 +235,9 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
   radio_.setAutoAck(1);
   radio_.setRetries(radio_config_.retry_delay, radio_config_.retry_count);
   radio_.setCRCLength(radio_config_.crc_length);
-  CHECK(radio_.isChipConnected(), "NRF24L01 is unavailable");
+  CHECK(radio_.isChipConnected(), "NRF24L01 is unavailable (ce=%u csn=%u)",
+      static_cast<unsigned>(ce_pin_),
+      static_cast<unsigned>(csn_pin_));
   if (irq_pin_ >= 0 && !InitializeIrq()) {
     LOGE("Falling back to RX polling because IRQ setup failed for pin %d", irq_pin_);
   }

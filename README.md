@@ -90,6 +90,20 @@ Peer 역시 `PENDING`을 통해 자신에게 전송할 데이터가 있음을 �
 Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
 특히 `--channel`, `--primary_addr`, `--secondary_addr`, 그리고 RF 튜닝 옵션은 반드시 양 끝단이 일치해야 합니다.
 
+단일 RF 기준 주요 실행 옵션:
+
+- `--ce_pin`: nRF24L01 CE 핀
+- `--csn_pin`: nRF24L01 SPI CSN 핀
+- `--channel`: RF 채널
+- `--irq_pin`: 선택적 RX IRQ GPIO
+
+듀얼 RF 사용 시 추가 옵션:
+
+- `--radio2_ce_pin`: 두 번째 nRF24L01 CE 핀
+- `--radio2_csn_pin`: 두 번째 nRF24L01 SPI CSN 핀
+- `--radio2_channel`: 두 번째 RF 채널, 생략 시 `channel + 1`
+- `--radio2_irq_pin`: 두 번째 nRF24L01 IRQ GPIO
+
 ### Coordinator 실행 예시
 
 ```bash
@@ -98,6 +112,8 @@ Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
   --interface_name nerf0 \
   --tunnel_ip 192.168.10.1 \
   --tunnel_mask 255.255.255.0 \
+  --ce_pin 25 \
+  --csn_pin 0 \
   --channel 1 \
   --poll_interval_us 100
 ```
@@ -110,6 +126,8 @@ Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
   --interface_name nerf0 \
   --tunnel_ip 192.168.10.2 \
   --tunnel_mask 255.255.255.0 \
+  --ce_pin 25 \
+  --csn_pin 0 \
   --channel 1
 ```
 
@@ -119,9 +137,67 @@ Coordinator / Peer 양쪽 모두 동일한 RF 설정을 사용해야 합니다.
 기본 RF 설정으로 실험할 때는 `--rf_*` 옵션을 주지 않으면 됩니다.
 
 ```bash
-sudo ./run.sh --primary --ce_pin 25
-sudo ./run.sh --secondary --ce_pin 25
+sudo ./run.sh --primary --ce_pin 25 --csn_pin 0
+sudo ./run.sh --secondary --ce_pin 25 --csn_pin 0
 ```
+
+### Dual radio 병렬 모드
+
+2개의 nRF24L01 을 병렬로 사용할 때는 각 모듈이 서로 다른 `CE`, `CSN`, `channel`
+조합을 가져야 합니다. 주소(`primary_addr`, `secondary_addr`)는 그대로 공유해도 되며,
+채널만 분리해서 같은 TUN 인터페이스에 병렬로 붙습니다.
+
+현재 구현 방식:
+
+- `radio0`, `radio1` 각각이 독립적인 기존 MAC 세션으로 동작합니다.
+- 두 세션은 같은 TUN 인터페이스를 공유하며 병렬로 패킷을 운반합니다.
+- 즉, 2채널 병렬 대역폭 확장용 1차 구조이며 링크 간 재정렬 가능성은 남아 있습니다.
+
+기본 동작:
+
+- `radio0`: `--ce_pin`, `--csn_pin`, `--channel`, `--irq_pin`
+- `radio1`: `--radio2_ce_pin`, `--radio2_csn_pin`, `--radio2_channel`, `--radio2_irq_pin`
+- `--radio2_channel` 을 생략하면 기본값은 `channel + 1`
+- `--radio2_ce_pin` 을 주지 않으면 기존 단일 RF 모드로 동작합니다.
+
+Coordinator 예시:
+
+```bash
+sudo ./run.sh \
+  --primary \
+  --ce_pin 25 --csn_pin 0 --channel 1 --irq_pin 6 \
+  --radio2_ce_pin 24 --radio2_csn_pin 1 --radio2_channel 2 --radio2_irq_pin 5
+```
+
+Peer 예시:
+
+```bash
+sudo ./run.sh \
+  --secondary \
+  --ce_pin 25 --csn_pin 0 --channel 1 --irq_pin 6 \
+  --radio2_ce_pin 24 --radio2_csn_pin 1 --radio2_channel 2 --radio2_irq_pin 5
+```
+
+직접 바이너리 실행 예시:
+
+```bash
+./build/aarch64-release/nerfnet/nerfnet \
+  --primary \
+  --interface_name nerf0 \
+  --tunnel_ip 192.168.10.1 \
+  --tunnel_mask 255.255.255.0 \
+  --ce_pin 25 --csn_pin 0 --channel 1 --irq_pin 6 \
+  --radio2_ce_pin 24 --radio2_csn_pin 1 --radio2_channel 2 --radio2_irq_pin 5 \
+  --poll_interval_us 100
+```
+
+주의:
+
+- `radio0` 와 `radio1` 의 `CE`, `CSN` 은 반드시 서로 달라야 합니다.
+- `radio0` 와 `radio1` 의 `channel` 도 서로 다르게 쓰는 것을 권장합니다.
+- 양 끝단은 동일한 dual-radio 배치로 실행해야 합니다.
+- 한쪽만 dual-radio 로 실행하면 기대한 병렬 효과를 얻을 수 없습니다.
+- 패킷은 두 링크로 분산되어 흐르므로 장기적인 성능 튜닝은 `send_fail`, 채널 간 편차, 재정렬 영향까지 함께 봐야 합니다.
 
 ### RX IRQ 옵션
 
@@ -137,15 +213,15 @@ sudo ./run.sh --secondary --ce_pin 25
 예를 들어 Raspberry Pi 에서 physical pin 31 = GPIO 6 인 경우 아래처럼 실행할 수 있습니다.
 
 ```bash
-sudo ./run.sh --primary --ce_pin 25 --irq_pin 6
-sudo ./run.sh --secondary --ce_pin 25 --irq_pin 6
+sudo ./run.sh --primary --ce_pin 25 --csn_pin 0 --irq_pin 6
+sudo ./run.sh --secondary --ce_pin 25 --csn_pin 0 --irq_pin 6
 ```
 
 기존처럼 sysfs global GPIO 번호를 직접 넣어도 됩니다.
 
 ```bash
-sudo ./run.sh --primary --ce_pin 25 --irq_pin 518
-sudo ./run.sh --secondary --ce_pin 25 --irq_pin 518
+sudo ./run.sh --primary --ce_pin 25 --csn_pin 0 --irq_pin 518
+sudo ./run.sh --secondary --ce_pin 25 --csn_pin 0 --irq_pin 518
 ```
 
 주의:

@@ -47,6 +47,7 @@ class RadioInterface : public NonCopyable {
   };
 
   RadioInterface(uint16_t ce_pin,
+                 uint16_t csn_pin,
                  int tunnel_fd,
                  uint32_t primary_addr,
                  uint32_t secondary_addr,
@@ -95,6 +96,8 @@ class RadioInterface : public NonCopyable {
   static constexpr uint8_t kMaxSeq = 31;
 
   RF24 radio_;
+  const uint16_t ce_pin_;
+  const uint16_t csn_pin_;
   const int tunnel_fd_;
   const uint32_t primary_addr_;
   const uint32_t secondary_addr_;
