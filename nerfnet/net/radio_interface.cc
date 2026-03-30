@@ -911,6 +911,7 @@ bool RadioInterface::CanCurrentLinkSendFragmentLocked(const TxFragmentState& fra
 void RadioInterface::MarkFragmentSentLocked(TxFragmentState& fragment, uint64_t now_us) {
   EnsureLinkStateLocked();
   fragment.last_send_us = now_us;
+  fragment.duplicate_ack_count = 0;
   ++fragment.send_count;
   fragment.last_tx_link = static_cast<uint8_t>(link_index_);
   if (fragment.preferred_link == 0xFF ||
@@ -1061,10 +1062,23 @@ void RadioInterface::CommitAckLocked(uint8_t ack_seq) {
   }
 
   if (ack_it == mac_state_->tx_window.end()) {
+    auto& oldest = mac_state_->tx_window.front();
+    const uint8_t expected_dup_ack = oldest.seq == 1 ? kMaxSeq : static_cast<uint8_t>(oldest.seq - 1);
+    if (ack_seq == expected_dup_ack) {
+      oldest.duplicate_ack_count = static_cast<uint8_t>(std::min<unsigned int>(oldest.duplicate_ack_count + 1, 255));
+      if (oldest.duplicate_ack_count >= 3) {
+        // Fast retransmit: make the missing fragment immediately eligible on any link.
+        oldest.last_send_us = 0;
+        oldest.preferred_link = 0xFF;
+      }
+    }
     return;
   }
 
   mac_state_->tx_window.erase(mac_state_->tx_window.begin(), std::next(ack_it));
+  if (!mac_state_->tx_window.empty()) {
+    mac_state_->tx_window.front().duplicate_ack_count = 0;
+  }
 }
 
 bool RadioInterface::ConsumeDataFrameLocked(const MacFrame& frame) {

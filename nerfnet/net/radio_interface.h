@@ -56,6 +56,7 @@ class RadioInterface : public NonCopyable {
     uint32_t send_count = 0;
     uint8_t preferred_link = 0xFF;
     uint8_t last_tx_link = 0xFF;
+    uint8_t duplicate_ack_count = 0;
   };
 
   struct LinkQualityState {
