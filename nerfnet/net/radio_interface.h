@@ -54,6 +54,19 @@ class RadioInterface : public NonCopyable {
     std::vector<uint8_t> payload;
     uint64_t last_send_us = 0;
     uint32_t send_count = 0;
+    uint8_t preferred_link = 0xFF;
+    uint8_t last_tx_link = 0xFF;
+  };
+
+  struct LinkQualityState {
+    int score = 1000;
+    uint32_t send_successes = 0;
+    uint32_t send_failures = 0;
+    uint32_t receive_timeouts = 0;
+    uint32_t consecutive_failures = 0;
+    uint64_t last_success_us = 0;
+    uint64_t last_failure_us = 0;
+    uint64_t last_data_send_us = 0;
   };
 
   struct RxFragmentState {
@@ -69,6 +82,7 @@ class RadioInterface : public NonCopyable {
     std::deque<TxFragmentState> tx_window;
     std::optional<uint8_t> last_rx_seq;
     std::map<uint8_t, RxFragmentState> rx_reorder_buffer;
+    std::vector<LinkQualityState> link_states;
   };
 
   RadioInterface(uint16_t ce_pin,
@@ -141,6 +155,8 @@ class RadioInterface : public NonCopyable {
   std::string resolved_irq_chip_name_;
   unsigned int resolved_irq_line_offset_;
   int resolved_irq_global_gpio_;
+  size_t link_index_;
+  FrameType last_tx_frame_type_;
 
   RequestResult Send(const std::vector<uint8_t>& request);
   RequestResult Receive(std::vector<uint8_t>& response, uint64_t timeout_us = 0);
@@ -155,6 +171,11 @@ class RadioInterface : public NonCopyable {
   bool IsExpectedRxSeq(uint8_t seq) const;
   uint8_t NextSeq(uint8_t seq) const;
   void ResetRxAssemblyLocked();
+  void EnsureLinkStateLocked();
+  int GetLinkScoreLocked(size_t link_index) const;
+  bool CanCurrentLinkOriginateLocked(uint64_t now_us) const;
+  bool CanCurrentLinkSendFragmentLocked(const TxFragmentState& fragment, uint64_t now_us) const;
+  void MarkFragmentSentLocked(TxFragmentState& fragment, uint64_t now_us);
 
   // Frame codec.
   bool EncodeMacFrame(const MacFrame& frame, std::vector<uint8_t>& packet);
@@ -175,6 +196,8 @@ class RadioInterface : public NonCopyable {
   void CleanupIrq();
   RequestResult WaitForRxReady(uint64_t timeout_us);
   void RecoverAfterTransmitFailure(const char* stage);
+  void RecordLinkSuccess();
+  void RecordLinkFailure(bool timeout_failure);
 };
 
 }  // namespace nerfnet

@@ -170,12 +170,25 @@ void PrimaryRadioInterface::Run() {
     }
 
     if (stat_now_us - last_stat_print_us_ >= 1000000) {
-      const size_t tx_window_size = mac_state_->tx_window.size();
-      const size_t rx_reorder_size = mac_state_->rx_reorder_buffer.size();
+      size_t tx_window_size = 0;
+      size_t rx_reorder_size = 0;
+      int link0_score = 1000;
+      int link1_score = 1000;
+      {
+        std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+        tx_window_size = mac_state_->tx_window.size();
+        rx_reorder_size = mac_state_->rx_reorder_buffer.size();
+        if (!mac_state_->link_states.empty()) {
+          link0_score = mac_state_->link_states[0].score;
+        }
+        if (mac_state_->link_states.size() > 1) {
+          link1_score = mac_state_->link_states[1].score;
+        }
+      }
       LOGI("[COORD][STAT] pend_tx=%llu grant_tx=%llu data_tx=%llu "
            "ack_rx=%llu pend_rx=%llu data_rx=%llu "
            "send_fail=%llu sf_pend=%llu sf_grant=%llu sf_data=%llu sf_ack=%llu sf_reset=%llu "
-           "rx_timeout=%llu tx_window=%zu rx_reorder=%zu disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
+           "rx_timeout=%llu tx_window=%zu rx_reorder=%zu link0_score=%d link1_score=%d disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
            static_cast<unsigned long long>(tx_pending_count_),
            static_cast<unsigned long long>(tx_grant_count_),
            static_cast<unsigned long long>(tx_data_count_),
@@ -191,6 +204,8 @@ void PrimaryRadioInterface::Run() {
            static_cast<unsigned long long>(rx_timeout_count_),
            tx_window_size,
            rx_reorder_size,
+           link0_score,
+           link1_score,
            disconnected_ ? 1u : 0u,
            poll_fail_count_,
            send_fail_streak_,

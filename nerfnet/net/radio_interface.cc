@@ -434,7 +434,7 @@ void TunnelDispatchLoop(const std::shared_ptr<TunnelDispatcher>& dispatcher) {
   }
 }
 
-void RegisterTunnelDispatcher(int tunnel_fd, RadioInterface* interface) {
+size_t RegisterTunnelDispatcher(int tunnel_fd, RadioInterface* interface) {
   std::shared_ptr<TunnelDispatcher> dispatcher;
   bool start_thread = false;
 
@@ -456,14 +456,18 @@ void RegisterTunnelDispatcher(int tunnel_fd, RadioInterface* interface) {
     }
   }
 
+  size_t link_index = 0;
   {
     std::lock_guard<std::mutex> lock(dispatcher->mutex);
     dispatcher->interfaces.push_back(interface);
+    link_index = dispatcher->interfaces.size() - 1;
   }
 
   if (start_thread) {
     dispatcher->thread = std::thread(TunnelDispatchLoop, dispatcher);
   }
+
+  return link_index;
 }
 
 void UnregisterTunnelDispatcher(int tunnel_fd, RadioInterface* interface) {
@@ -524,7 +528,9 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
       irq_chip_(nullptr),
       irq_line_(nullptr),
       resolved_irq_line_offset_(0),
-      resolved_irq_global_gpio_(-1) {
+      resolved_irq_global_gpio_(-1),
+      link_index_(0),
+      last_tx_frame_type_(FrameType::Invalid) {
   CHECK(channel < 128, "Channel must be between 0 and 127");
   CHECK(radio_.begin(), "Failed to start NRF24L01 (ce=%u csn=%u)",
       static_cast<unsigned>(ce_pin_),
@@ -544,7 +550,11 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
   }
 
 
-  RegisterTunnelDispatcher(tunnel_fd_, this);
+  link_index_ = RegisterTunnelDispatcher(tunnel_fd_, this);
+  {
+    std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+    EnsureLinkStateLocked();
+  }
 }
 
 RadioInterface::~RadioInterface() {
@@ -699,9 +709,49 @@ void RadioInterface::RecoverAfterTransmitFailure(const char* stage) {
   SleepUs(kTxFailureRecoveryGapUs);
 }
 
+void RadioInterface::RecordLinkSuccess() {
+  std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+  EnsureLinkStateLocked();
+  auto& state = mac_state_->link_states[link_index_];
+  state.last_success_us = TimeNowUs();
+  state.consecutive_failures = 0;
+  ++state.send_successes;
+
+  // Avoid promoting a link just because control/ACK traffic succeeds.
+  if (last_tx_frame_type_ == FrameType::Data) {
+    state.score = std::min(state.score + 12, 1400);
+  } else if (last_tx_frame_type_ == FrameType::Grant) {
+    state.score = std::min(state.score + 2, 1200);
+  }
+}
+
+void RadioInterface::RecordLinkFailure(bool timeout_failure) {
+  std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+  EnsureLinkStateLocked();
+  auto& state = mac_state_->link_states[link_index_];
+  state.last_failure_us = TimeNowUs();
+  ++state.consecutive_failures;
+  ++state.send_failures;
+  if (timeout_failure) {
+    ++state.receive_timeouts;
+  }
+
+  const bool data_like =
+      last_tx_frame_type_ == FrameType::Data ||
+      last_tx_frame_type_ == FrameType::Grant;
+  const int penalty = timeout_failure ? (data_like ? 120 : 40) : (data_like ? 60 : 20);
+  state.score = std::max(state.score - penalty, 100);
+}
+
 RadioInterface::RequestResult RadioInterface::Send(
     const std::vector<uint8_t>& request) {
   radio_.stopListening();
+
+  if (!request.empty()) {
+    last_tx_frame_type_ = static_cast<FrameType>(request[0]);
+  } else {
+    last_tx_frame_type_ = FrameType::Invalid;
+  }
 
   if (request.size() > kMaxPacketSize) {
     LOGE("Request is too large (%zu vs %zu)", request.size(), kMaxPacketSize);
@@ -711,6 +761,7 @@ RadioInterface::RequestResult RadioInterface::Send(
   if (!radio_.write(request.data(), request.size())) {
     LOGE("Failed to write request");
     RecoverAfterTransmitFailure("write");
+    RecordLinkFailure(false);
     return RequestResult::TransmitError;
   }
 
@@ -719,6 +770,7 @@ RadioInterface::RequestResult RadioInterface::Send(
     if (TimeNowUs() >= standby_deadline_us) {
       LOGE("Timed out waiting for TX standby");
       RecoverAfterTransmitFailure("txStandBy");
+      RecordLinkFailure(false);
       return RequestResult::TransmitError;
     }
     SleepUs(50);
@@ -733,10 +785,12 @@ RadioInterface::RequestResult RadioInterface::Receive(
 
   const auto wait_result = WaitForRxReady(timeout_us);
   if (wait_result != RequestResult::Success) {
+    RecordLinkFailure(wait_result == RequestResult::Timeout);
     return wait_result;
   }
 
   radio_.read(response.data(), response.size());
+  RecordLinkSuccess();
   return RequestResult::Success;
 }
 
@@ -776,6 +830,94 @@ void RadioInterface::AdvanceTxSeq() {
   if (mac_state_->next_tx_seq == 0 || mac_state_->next_tx_seq > kMaxSeq) {
     mac_state_->next_tx_seq = 1;
   }
+}
+
+void RadioInterface::EnsureLinkStateLocked() {
+  if (mac_state_->link_states.size() <= link_index_) {
+    mac_state_->link_states.resize(link_index_ + 1);
+  }
+}
+
+int RadioInterface::GetLinkScoreLocked(size_t link_index) const {
+  if (link_index >= mac_state_->link_states.size()) {
+    return 1000;
+  }
+  return mac_state_->link_states[link_index].score;
+}
+
+bool RadioInterface::CanCurrentLinkOriginateLocked(uint64_t now_us) const {
+  if (mac_state_->link_states.size() <= 1) {
+    return true;
+  }
+
+  const auto& current_state = mac_state_->link_states[link_index_];
+  const int current_score = GetLinkScoreLocked(link_index_);
+  size_t best_index = 0;
+  int best_score = GetLinkScoreLocked(0);
+  for (size_t i = 1; i < mac_state_->link_states.size(); ++i) {
+    const int score = GetLinkScoreLocked(i);
+    if (score > best_score) {
+      best_score = score;
+      best_index = i;
+    }
+  }
+
+  if (link_index_ == best_index) {
+    return true;
+  }
+
+  const auto& best_state = mac_state_->link_states[best_index];
+  if (current_score + 80 >= best_score && current_state.consecutive_failures <= 1) {
+    return true;
+  }
+
+  const uint64_t best_idle_us = best_state.last_data_send_us == 0 ? now_us : (now_us - best_state.last_data_send_us);
+  const uint64_t current_idle_us = current_state.last_data_send_us == 0 ? now_us : (now_us - current_state.last_data_send_us);
+  if (current_state.consecutive_failures == 0 && best_idle_us >= 3000) {
+    return true;
+  }
+
+  // Allow a non-best link to originate occasionally so scores can recover from stale control bias.
+  return current_state.consecutive_failures == 0 && current_idle_us >= 8000;
+}
+
+bool RadioInterface::CanCurrentLinkSendFragmentLocked(const TxFragmentState& fragment, uint64_t now_us) const {
+  if (mac_state_->link_states.size() <= 1) {
+    return true;
+  }
+
+  if (fragment.preferred_link == 0xFF || fragment.preferred_link == link_index_) {
+    return true;
+  }
+
+  if (fragment.preferred_link >= mac_state_->link_states.size()) {
+    return true;
+  }
+
+  const auto& preferred_state = mac_state_->link_states[fragment.preferred_link];
+  const auto& current_state = mac_state_->link_states[link_index_];
+  if (preferred_state.consecutive_failures >= 2) {
+    return true;
+  }
+
+  if (preferred_state.last_failure_us != 0 &&
+      (now_us - preferred_state.last_failure_us) <= 6000) {
+    return true;
+  }
+
+  return current_state.score >= (preferred_state.score + 120);
+}
+
+void RadioInterface::MarkFragmentSentLocked(TxFragmentState& fragment, uint64_t now_us) {
+  EnsureLinkStateLocked();
+  fragment.last_send_us = now_us;
+  ++fragment.send_count;
+  fragment.last_tx_link = static_cast<uint8_t>(link_index_);
+  if (fragment.preferred_link == 0xFF ||
+      GetLinkScoreLocked(link_index_) >= GetLinkScoreLocked(fragment.preferred_link)) {
+    fragment.preferred_link = static_cast<uint8_t>(link_index_);
+  }
+  mac_state_->link_states[link_index_].last_data_send_us = now_us;
 }
 
 uint8_t RadioInterface::NextSeq(uint8_t seq) const {
@@ -855,46 +997,29 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   frame.ack = mac_state_->last_rx_seq.value_or(kNoSeq);
   frame.pending = PendingHintLocked();
 
+  EnsureLinkStateLocked();
   const uint64_t now_us = TimeNowUs();
-  if (!mac_state_->tx_window.empty()) {
-    auto& oldest = mac_state_->tx_window.front();
-    const bool window_full = mac_state_->tx_window.size() >= kBondTxWindowSize;
-    const bool retry_due = oldest.last_send_us == 0 ||
-        (now_us - oldest.last_send_us) >= kBondRetransmitIntervalUs;
-    if ((window_full || mac_state_->read_buffer.empty()) && retry_due) {
-      oldest.last_send_us = now_us;
-      ++oldest.send_count;
-      frame.seq = oldest.seq;
-      frame.arg = oldest.bytes_left;
-      frame.payload = oldest.payload;
-      return true;
+
+  for (auto& fragment : mac_state_->tx_window) {
+    const bool retry_due = fragment.last_send_us == 0 ||
+        (now_us - fragment.last_send_us) >= kBondRetransmitIntervalUs;
+    if (!retry_due || !CanCurrentLinkSendFragmentLocked(fragment, now_us)) {
+      continue;
     }
+
+    MarkFragmentSentLocked(fragment, now_us);
+    frame.seq = fragment.seq;
+    frame.arg = fragment.bytes_left;
+    frame.payload = fragment.payload;
+    return true;
   }
 
   if (mac_state_->tx_window.size() >= kBondTxWindowSize) {
-    if (mac_state_->tx_window.empty()) {
-      return false;
-    }
-    auto& oldest = mac_state_->tx_window.front();
-    oldest.last_send_us = now_us;
-    ++oldest.send_count;
-    frame.seq = oldest.seq;
-    frame.arg = oldest.bytes_left;
-    frame.payload = oldest.payload;
-    return true;
+    return false;
   }
 
-  if (mac_state_->read_buffer.empty()) {
-    if (mac_state_->tx_window.empty()) {
-      return false;
-    }
-    auto& oldest = mac_state_->tx_window.front();
-    oldest.last_send_us = now_us;
-    ++oldest.send_count;
-    frame.seq = oldest.seq;
-    frame.arg = oldest.bytes_left;
-    frame.payload = oldest.payload;
-    return true;
+  if (mac_state_->read_buffer.empty() || !CanCurrentLinkOriginateLocked(now_us)) {
+    return false;
   }
 
   auto& current = mac_state_->read_buffer.front();
@@ -904,8 +1029,7 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   fragment.seq = mac_state_->next_tx_seq;
   fragment.bytes_left = static_cast<uint8_t>(std::min<size_t>(current.size(), 255));
   fragment.payload.assign(current.begin(), current.begin() + transfer_size);
-  fragment.last_send_us = now_us;
-  fragment.send_count = 1;
+  fragment.preferred_link = static_cast<uint8_t>(link_index_);
 
   current.erase(current.begin(), current.begin() + transfer_size);
   if (current.empty()) {
@@ -913,11 +1037,13 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   }
 
   mac_state_->tx_window.push_back(fragment);
+  MarkFragmentSentLocked(mac_state_->tx_window.back(), now_us);
   AdvanceTxSeq();
 
-  frame.seq = fragment.seq;
-  frame.arg = fragment.bytes_left;
-  frame.payload = fragment.payload;
+  const auto& scheduled = mac_state_->tx_window.back();
+  frame.seq = scheduled.seq;
+  frame.arg = scheduled.bytes_left;
+  frame.payload = scheduled.payload;
   return true;
 }
 
