@@ -166,7 +166,7 @@ int main(int argc, char** argv) {
   TCLAP::ValueArg<uint32_t> secondary_addr_arg("", "secondary_addr",
       "The address to use for the secondary side of nerfnet.",
       false, 0x90009000, "address", cmd);
-  TCLAP::ValueArg<uint8_t> channel_arg("", "channel",
+  TCLAP::ValueArg<int> channel_arg("", "channel",
       "The channel to use for transmit/receive.", false, 1, "channel", cmd);
   TCLAP::ValueArg<int> radio2_channel_arg("", "radio2_channel",
       "Optional RF channel for the second NRF24L01. Defaults to channel+1.",
@@ -201,11 +201,15 @@ int main(int argc, char** argv) {
       "--rf_retry_count must be between 0 and 15");
   radio_config.retry_delay = static_cast<uint8_t>(rf_retry_delay_arg.getValue());
   radio_config.retry_count = static_cast<uint8_t>(rf_retry_count_arg.getValue());
+  CHECK(channel_arg.getValue() >= 0 && channel_arg.getValue() < 128,
+      "--channel must be between 0 and 127");
+  const uint8_t channel = static_cast<uint8_t>(channel_arg.getValue());
+
 
   const bool dual_radio_enabled = radio2_ce_pin_arg.getValue() >= 0;
   const int radio2_channel_raw = radio2_channel_arg.getValue() >= 0 ?
       radio2_channel_arg.getValue() :
-      static_cast<int>(channel_arg.getValue()) + 1;
+      static_cast<int>(channel) + 1;
   if (dual_radio_enabled) {
     CHECK(radio2_channel_raw >= 0 && radio2_channel_raw < 128,
         "--radio2_channel must be between 0 and 127");
@@ -240,7 +244,7 @@ int main(int argc, char** argv) {
     auto radio_interface = std::make_unique<nerfnet::PrimaryRadioInterface>(
         ce_pin_arg.getValue(), csn_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-        channel_arg.getValue(), poll_interval_us_arg.getValue(), radio_config,
+        channel, poll_interval_us_arg.getValue(), radio_config,
         irq_pin_arg.getValue());
     radio_interface->SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
 
@@ -260,7 +264,7 @@ int main(int argc, char** argv) {
       LOGI("Dual-radio mode enabled for coordinator: radio0(ce=%u,csn=%u,ch=%u) radio1(ce=%d,csn=%u,ch=%u)",
            static_cast<unsigned>(ce_pin_arg.getValue()),
            static_cast<unsigned>(csn_pin_arg.getValue()),
-           static_cast<unsigned>(channel_arg.getValue()),
+           static_cast<unsigned>(channel),
            radio2_ce_pin_arg.getValue(),
            static_cast<unsigned>(radio2_csn_pin_arg.getValue()),
            static_cast<unsigned>(radio2_channel));
@@ -274,7 +278,7 @@ int main(int argc, char** argv) {
     auto radio_interface = std::make_unique<nerfnet::SecondaryRadioInterface>(
         ce_pin_arg.getValue(), csn_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-        channel_arg.getValue(), radio_config, irq_pin_arg.getValue());
+        channel, radio_config, irq_pin_arg.getValue());
     radio_interface->SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
 
     std::unique_ptr<nerfnet::SecondaryRadioInterface> radio2_interface;
@@ -292,7 +296,7 @@ int main(int argc, char** argv) {
       LOGI("Dual-radio mode enabled for peer: radio0(ce=%u,csn=%u,ch=%u) radio1(ce=%d,csn=%u,ch=%u)",
            static_cast<unsigned>(ce_pin_arg.getValue()),
            static_cast<unsigned>(csn_pin_arg.getValue()),
-           static_cast<unsigned>(channel_arg.getValue()),
+           static_cast<unsigned>(channel),
            radio2_ce_pin_arg.getValue(),
            static_cast<unsigned>(radio2_csn_pin_arg.getValue()),
            static_cast<unsigned>(radio2_channel));

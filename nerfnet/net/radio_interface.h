@@ -82,6 +82,7 @@ class RadioInterface : public NonCopyable {
   };
 
   void SetTunnelLogsEnabled(bool enabled) { tunnel_logs_enabled_ = enabled; }
+  void EnqueueTunnelPacket(std::vector<uint8_t> packet);
 
  protected:
   static constexpr uint32_t kPollIntervalUs = 1000;
@@ -104,7 +105,6 @@ class RadioInterface : public NonCopyable {
   const RadioConfig radio_config_;
 
   std::atomic<bool> running_;
-  std::thread tunnel_thread_;
 
   std::mutex read_buffer_mutex_;
   std::deque<std::vector<uint8_t>> read_buffer_;
@@ -141,9 +141,6 @@ class RadioInterface : public NonCopyable {
   bool IsExpectedRxSeq(uint8_t seq) const;
   uint8_t NextSeq(uint8_t seq) const;
   void ResetRxAssemblyLocked();
-
-  // Thread that reads from TUN and buffers complete IP frames.
-  void TunnelThread();
 
   // Frame codec.
   bool EncodeMacFrame(const MacFrame& frame, std::vector<uint8_t>& packet);

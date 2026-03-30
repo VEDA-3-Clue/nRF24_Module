@@ -25,8 +25,10 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <memory>
 #include <optional>
 #include <string>
+#include <unordered_map>
 
 #include "nerfnet/util/log.h"
 #include "nerfnet/util/time.h"
@@ -196,6 +198,211 @@ std::optional<ResolvedIrqTarget> ResolveIrqTarget(int irq_pin) {
   return ResolveIrqTargetFromOffset(irq_pin);
 }
 
+bool IsValidIpPacketForDispatch(const std::vector<uint8_t>& packet) {
+  if (packet.empty()) {
+    return false;
+  }
+
+  const uint8_t version = static_cast<uint8_t>(packet[0] >> 4);
+
+  if (version == 4) {
+    if (packet.size() < 20) {
+      return false;
+    }
+
+    const size_t ihl = static_cast<size_t>(packet[0] & 0x0F) * 4;
+    if (ihl < 20 || packet.size() < ihl) {
+      return false;
+    }
+
+    const uint16_t total_len =
+        static_cast<uint16_t>((static_cast<uint16_t>(packet[2]) << 8) |
+                              static_cast<uint16_t>(packet[3]));
+    if (total_len < ihl) {
+      return false;
+    }
+
+    return packet.size() == total_len;
+  }
+
+  if (version == 6) {
+    if (packet.size() < 40) {
+      return false;
+    }
+
+    const uint16_t payload_len =
+        static_cast<uint16_t>((static_cast<uint16_t>(packet[4]) << 8) |
+                              static_cast<uint16_t>(packet[5]));
+    return packet.size() == static_cast<size_t>(40 + payload_len);
+  }
+
+  return false;
+}
+
+uint64_t Fnv1aInit() {
+  return 1469598103934665603ull;
+}
+
+void Fnv1aMix(uint64_t& hash, uint8_t value) {
+  hash ^= static_cast<uint64_t>(value);
+  hash *= 1099511628211ull;
+}
+
+void Fnv1aMixBytes(uint64_t& hash, const uint8_t* data, size_t size) {
+  for (size_t i = 0; i < size; ++i) {
+    Fnv1aMix(hash, data[i]);
+  }
+}
+
+uint64_t HashPacketFlow(const std::vector<uint8_t>& packet) {
+  if (packet.empty()) {
+    return 0;
+  }
+
+  uint64_t hash = Fnv1aInit();
+  const uint8_t version = static_cast<uint8_t>(packet[0] >> 4);
+
+  if (version == 4 && packet.size() >= 20) {
+    const size_t ihl = static_cast<size_t>(packet[0] & 0x0F) * 4;
+    if (ihl >= 20 && packet.size() >= ihl) {
+      const uint8_t proto = packet[9];
+      Fnv1aMix(hash, proto);
+      Fnv1aMixBytes(hash, &packet[12], 8);
+      if ((proto == 6 || proto == 17) && packet.size() >= ihl + 4) {
+        Fnv1aMixBytes(hash, &packet[ihl], 4);
+      }
+      return hash;
+    }
+  }
+
+  if (version == 6 && packet.size() >= 40) {
+    const uint8_t next_header = packet[6];
+    Fnv1aMix(hash, next_header);
+    Fnv1aMixBytes(hash, &packet[8], 32);
+    if ((next_header == 6 || next_header == 17) && packet.size() >= 44) {
+      Fnv1aMixBytes(hash, &packet[40], 4);
+    }
+    return hash;
+  }
+
+  Fnv1aMixBytes(hash, packet.data(), std::min<size_t>(packet.size(), 16));
+  return hash;
+}
+
+struct TunnelDispatcher {
+  int tunnel_key_fd = -1;
+  int read_fd = -1;
+  std::atomic<bool> running{true};
+  std::mutex mutex;
+  std::vector<RadioInterface*> interfaces;
+  std::thread thread;
+};
+
+std::mutex g_tunnel_dispatchers_mutex;
+std::unordered_map<int, std::shared_ptr<TunnelDispatcher>> g_tunnel_dispatchers;
+
+void TunnelDispatchLoop(const std::shared_ptr<TunnelDispatcher>& dispatcher) {
+  uint8_t buffer[3200];
+
+  while (dispatcher->running.load()) {
+    const int bytes_read = read(dispatcher->read_fd, buffer, sizeof(buffer));
+    if (bytes_read < 0) {
+      if (!dispatcher->running.load()) {
+        break;
+      }
+      LOGE("Failed to read shared tunnel fd: %s (%d)", strerror(errno), errno);
+      continue;
+    }
+
+    if (bytes_read == 0) {
+      if (!dispatcher->running.load()) {
+        break;
+      }
+      SleepUs(1000);
+      continue;
+    }
+
+    std::vector<uint8_t> packet(&buffer[0], &buffer[bytes_read]);
+    if (!IsValidIpPacketForDispatch(packet)) {
+      LOGE("Dropping non-IP or malformed tunnel packet len=%d", bytes_read);
+      continue;
+    }
+
+    std::lock_guard<std::mutex> lock(dispatcher->mutex);
+    if (dispatcher->interfaces.empty()) {
+      continue;
+    }
+
+    const size_t index = static_cast<size_t>(HashPacketFlow(packet) % dispatcher->interfaces.size());
+    dispatcher->interfaces[index]->EnqueueTunnelPacket(std::move(packet));
+  }
+}
+
+void RegisterTunnelDispatcher(int tunnel_fd, RadioInterface* interface) {
+  std::shared_ptr<TunnelDispatcher> dispatcher;
+  bool start_thread = false;
+
+  {
+    std::lock_guard<std::mutex> lock(g_tunnel_dispatchers_mutex);
+    auto& entry = g_tunnel_dispatchers[tunnel_fd];
+    if (!entry) {
+      entry = std::make_shared<TunnelDispatcher>();
+      entry->tunnel_key_fd = tunnel_fd;
+      entry->read_fd = dup(tunnel_fd);
+      CHECK(entry->read_fd >= 0, "Failed to duplicate tunnel fd %d: %s (%d)",
+            tunnel_fd,
+            strerror(errno),
+            errno);
+      dispatcher = entry;
+      start_thread = true;
+    } else {
+      dispatcher = entry;
+    }
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(dispatcher->mutex);
+    dispatcher->interfaces.push_back(interface);
+  }
+
+  if (start_thread) {
+    dispatcher->thread = std::thread(TunnelDispatchLoop, dispatcher);
+  }
+}
+
+void UnregisterTunnelDispatcher(int tunnel_fd, RadioInterface* interface) {
+  std::shared_ptr<TunnelDispatcher> dispatcher;
+  bool stop_dispatcher = false;
+
+  {
+    std::lock_guard<std::mutex> lock(g_tunnel_dispatchers_mutex);
+    const auto it = g_tunnel_dispatchers.find(tunnel_fd);
+    if (it == g_tunnel_dispatchers.end()) {
+      return;
+    }
+    dispatcher = it->second;
+
+    std::lock_guard<std::mutex> dispatcher_lock(dispatcher->mutex);
+    dispatcher->interfaces.erase(
+        std::remove(dispatcher->interfaces.begin(), dispatcher->interfaces.end(), interface),
+        dispatcher->interfaces.end());
+    if (dispatcher->interfaces.empty()) {
+      g_tunnel_dispatchers.erase(it);
+      stop_dispatcher = true;
+    }
+  }
+
+  if (!stop_dispatcher) {
+    return;
+  }
+
+  dispatcher->running.store(false);
+  close(dispatcher->read_fd);
+  if (dispatcher->thread.joinable()) {
+    dispatcher->thread.join();
+  }
+}
+
 }  // namespace
 
 RadioInterface::RadioInterface(uint16_t ce_pin,
@@ -242,14 +449,13 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
     LOGE("Falling back to RX polling because IRQ setup failed for pin %d", irq_pin_);
   }
 
-  tunnel_thread_ = std::thread(&RadioInterface::TunnelThread, this);
+
+  RegisterTunnelDispatcher(tunnel_fd_, this);
 }
 
 RadioInterface::~RadioInterface() {
   running_ = false;
-  if (tunnel_thread_.joinable()) {
-    tunnel_thread_.join();
-  }
+  UnregisterTunnelDispatcher(tunnel_fd_, this);
   CleanupIrq();
 }
 
@@ -445,6 +651,23 @@ size_t RadioInterface::GetReadBufferSize() {
   return read_buffer_.size();
 }
 
+void RadioInterface::EnqueueTunnelPacket(std::vector<uint8_t> packet) {
+  constexpr size_t kMaxBufferedFrames = 1024;
+
+  std::lock_guard<std::mutex> lock(read_buffer_mutex_);
+  if (read_buffer_.size() >= kMaxBufferedFrames) {
+    LOGE("Dropping tunnel packet because TX queue is full on ce=%u csn=%u", 
+         static_cast<unsigned>(ce_pin_),
+         static_cast<unsigned>(csn_pin_));
+    return;
+  }
+
+  read_buffer_.push_back(std::move(packet));
+  if (tunnel_logs_enabled_) {
+    LOGI("Queued %zu bytes from shared tunnel dispatcher", read_buffer_.back().size());
+  }
+}
+
 size_t RadioInterface::GetTransferSize(const std::vector<uint8_t>& frame) {
   return std::min(frame.size(), static_cast<size_t>(kMaxPayloadSize));
 }
@@ -480,37 +703,6 @@ bool RadioInterface::IsExpectedRxSeq(uint8_t seq) const {
 void RadioInterface::ResetRxAssemblyLocked() {
   frame_buffer_.clear();
   last_rx_seq_.reset();
-}
-
-void RadioInterface::TunnelThread() {
-  constexpr size_t kMaxBufferedFrames = 1024;
-
-  uint8_t buffer[3200];
-  while (running_) {
-    const int bytes_read = read(tunnel_fd_, buffer, sizeof(buffer));
-    if (bytes_read < 0) {
-      LOGE("Failed to read: %s (%d)", strerror(errno), errno);
-      continue;
-    }
-
-    std::vector<uint8_t> packet(&buffer[0], &buffer[bytes_read]);
-    if (!IsValidIpPacket(packet)) {
-      LOGE("Dropping non-IP or malformed tunnel packet len=%d", bytes_read);
-      continue;
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-      read_buffer_.push_back(std::move(packet));
-      if (tunnel_logs_enabled_) {
-        LOGI("Read %zu bytes from tunnel", read_buffer_.back().size());
-      }
-    }
-
-    while (GetReadBufferSize() > kMaxBufferedFrames && running_) {
-      SleepUs(1000);
-    }
-  }
 }
 
 bool RadioInterface::EncodeMacFrame(const MacFrame& frame,
