@@ -992,6 +992,7 @@ bool RadioInterface::DecodeMacFrame(const std::vector<uint8_t>& packet,
 bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   constexpr size_t kBondTxWindowSize = 2;
   constexpr uint64_t kBondRetransmitIntervalUs = 2000;
+  constexpr uint64_t kHeadRecoveryRetransmitIntervalUs = 1200;
 
   frame = {};
   frame.type = FrameType::Data;
@@ -1001,9 +1002,13 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   EnsureLinkStateLocked();
   const uint64_t now_us = TimeNowUs();
 
-  for (auto& fragment : mac_state_->tx_window) {
+  for (size_t i = 0; i < mac_state_->tx_window.size(); ++i) {
+    auto& fragment = mac_state_->tx_window[i];
+    const uint64_t retransmit_interval_us =
+        (i == 0 && fragment.send_count > 0) ? kHeadRecoveryRetransmitIntervalUs
+                                            : kBondRetransmitIntervalUs;
     const bool retry_due = fragment.last_send_us == 0 ||
-        (now_us - fragment.last_send_us) >= kBondRetransmitIntervalUs;
+        (now_us - fragment.last_send_us) >= retransmit_interval_us;
     if (!retry_due || !CanCurrentLinkSendFragmentLocked(fragment, now_us)) {
       continue;
     }
@@ -1016,6 +1021,13 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   }
 
   if (mac_state_->tx_window.size() >= kBondTxWindowSize) {
+    return false;
+  }
+
+  const bool recovering_head = !mac_state_->tx_window.empty() &&
+      (mac_state_->tx_window.front().send_count > 0 ||
+       mac_state_->tx_window.front().duplicate_ack_count > 0);
+  if (recovering_head) {
     return false;
   }
 
@@ -1110,12 +1122,20 @@ bool RadioInterface::ConsumeDataFrameLocked(const MacFrame& frame) {
     return static_cast<uint8_t>(kMaxSeq - base + seq);
   };
 
-  const uint8_t delivered_seq = mac_state_->last_rx_seq.value_or(0);
+  uint8_t delivered_seq = mac_state_->last_rx_seq.value_or(0);
   if (delivered_seq != 0 && frame.seq == delivered_seq) {
     return true;
   }
   if (mac_state_->rx_reorder_buffer.find(frame.seq) != mac_state_->rx_reorder_buffer.end()) {
     return true;
+  }
+
+  if (delivered_seq == 0 && frame.seq != 1) {
+    // After a link reset, the sender may already have advanced its shared seq.
+    // Anchor the receive window to the first valid DATA frame we see so the
+    // session can resynchronize instead of rejecting every later seq forever.
+    mac_state_->last_rx_seq = (frame.seq == 1) ? kMaxSeq : static_cast<uint8_t>(frame.seq - 1);
+    delivered_seq = mac_state_->last_rx_seq.value();
   }
 
   const uint8_t forward_distance = seq_distance_forward(delivered_seq, frame.seq);

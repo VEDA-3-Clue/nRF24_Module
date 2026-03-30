@@ -277,10 +277,14 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
   tx.ack = last_rx_seq_.value_or(kNoSeq);
 
   bool local_has_data = false;
+  bool peer_rx_unsynced = false;
   {
     std::lock_guard<std::mutex> lock(read_buffer_mutex_);
     local_has_data = !mac_state_->tx_window.empty() || !read_buffer_.empty();
+    peer_rx_unsynced = !last_rx_seq_.has_value() || !mac_state_->rx_reorder_buffer.empty();
   }
+
+  const uint8_t grant_size = peer_rx_unsynced ? 1 : kDefaultBurstGrant;
 
   switch (state_) {
     case CoordinatorState::ResetSync:
@@ -294,7 +298,7 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
     case CoordinatorState::ActiveRx:
       tx.type = FrameType::Grant;
       tx.pending = local_has_data ? 1 : 0;
-      tx.arg = kDefaultBurstGrant;
+      tx.arg = grant_size;
       last_tx_was_data_ = false;
       ++tx_grant_count_;
       return true;
@@ -304,7 +308,7 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
         if (peer_has_pending_ && consecutive_local_data_frames_ >= kFairDataBurstLimit) {
           tx.type = FrameType::Grant;
           tx.pending = 1;
-          tx.arg = kDefaultBurstGrant;
+          tx.arg = grant_size;
           last_tx_was_data_ = false;
           ++tx_grant_count_;
           return true;
