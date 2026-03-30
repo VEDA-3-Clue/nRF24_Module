@@ -199,6 +199,35 @@ sudo ./run.sh \
 - 한쪽만 dual-radio 로 실행하면 기대한 병렬 효과를 얻을 수 없습니다.
 - 패킷은 두 링크로 분산되어 흐르므로 장기적인 성능 튜닝은 `send_fail`, 채널 간 편차, 재정렬 영향까지 함께 봐야 합니다.
 
+### Dual radio 현재 판단 메모
+
+기록 시각: `2026-03-30 02:35:50 UTC`
+
+최근 dual-radio 실험 결과 기준 현재 단계의 판단은 아래와 같습니다.
+
+- dual-radio 는 초기의 심한 재정렬/중복 문제는 완화되었지만, 아직 single-radio 최적 조합보다 확실한 우위를 만들지는 못했습니다.
+- 특히 `iperf3 -u -l 256 -b 15k -t 20` 기준으로 receiver loss/jitter 는 개선되었지만, 여전히 `send_fail`, `rx_timeout`, 세션 간 비대칭이 남아 있습니다.
+- 따라서 현 시점의 dual-radio 는 "이상적인 2채널 bonding" 이라기보다, 실험적 병렬 운반 구조에 가깝습니다.
+
+현재 단계의 한계:
+
+- 두 radio 가 완전히 통합된 하나의 전송 계층처럼 동작하지는 않습니다.
+- 링크별 지연 차이, 재전송, ACK 흐름이 남아 있어 장시간 부하에서 성능 편차가 큽니다.
+- 양방향 통신은 가능하지만, 영상 uplink 와 제어 downlink 를 동시에 안정적으로 최적화한 상태는 아직 아닙니다.
+- 따라서 "2채널이면 single 보다 항상 좋아야 한다" 는 기대를 현재 구현은 만족하지 못합니다.
+
+대안 1:
+
+- 실사용 기준선은 당분간 single-radio 최적 조합으로 유지합니다.
+- 즉 `2mbps + CRC8 + retry_delay 0 + retry_count 15`, `kPostDataExchangeGapUs = 250`, `libgpiod IRQ` 조합을 기본 권장 경로로 둡니다.
+- RC 차량 초기 통합 단계에서는 먼저 single 기준으로 영상/제어 양방향을 안정화하는 것이 가장 안전합니다.
+
+대안 2:
+
+- dual-radio 는 "병렬 분산" 대신 "역할 분리" 방향으로 발전시킵니다.
+- 예를 들어 `radio0` 는 bulk uplink(카메라/센서), `radio1` 는 control/ACK/downlink 우선으로 두는 구조가 현실적입니다.
+- 이 방향은 이상적인 bonding 은 아니지만, RC 차량처럼 `영상 uplink + 제어 downlink` 가 공존하는 시스템에서는 single 보다 나은 체감 성능을 만들 가능성이 더 큽니다.
+
 ### RX IRQ 옵션
 
 선택적으로 nRF24L01 의 `IRQ` 핀을 보드 GPIO 에 연결한 뒤 `--irq_pin` 으로 지정할 수 있습니다.

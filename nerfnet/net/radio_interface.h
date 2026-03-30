@@ -22,9 +22,11 @@
 #include <atomic>
 #include <cstdint>
 #include <deque>
-#include <string>
+#include <memory>
+#include <map>
 #include <mutex>
 #include <optional>
+#include <string>
 #include <thread>
 #include <vector>
 
@@ -46,6 +48,29 @@ class RadioInterface : public NonCopyable {
     uint8_t retry_count = 15;
   };
 
+  struct TxFragmentState {
+    uint8_t seq = 0;
+    uint8_t bytes_left = 0;
+    std::vector<uint8_t> payload;
+    uint64_t last_send_us = 0;
+    uint32_t send_count = 0;
+  };
+
+  struct RxFragmentState {
+    uint8_t bytes_left = 0;
+    std::vector<uint8_t> payload;
+  };
+
+  struct SharedMacState {
+    std::mutex read_buffer_mutex;
+    std::deque<std::vector<uint8_t>> read_buffer;
+    std::vector<uint8_t> frame_buffer;
+    uint8_t next_tx_seq = 1;
+    std::deque<TxFragmentState> tx_window;
+    std::optional<uint8_t> last_rx_seq;
+    std::map<uint8_t, RxFragmentState> rx_reorder_buffer;
+  };
+
   RadioInterface(uint16_t ce_pin,
                  uint16_t csn_pin,
                  int tunnel_fd,
@@ -53,7 +78,8 @@ class RadioInterface : public NonCopyable {
                  uint32_t secondary_addr,
                  uint8_t channel,
                  const RadioConfig& radio_config,
-                 int irq_pin = -1);
+                 int irq_pin = -1,
+                 std::shared_ptr<SharedMacState> shared_mac_state = nullptr);
   virtual ~RadioInterface();
 
   enum class RequestResult {
@@ -106,19 +132,7 @@ class RadioInterface : public NonCopyable {
 
   std::atomic<bool> running_;
 
-  std::mutex read_buffer_mutex_;
-  std::deque<std::vector<uint8_t>> read_buffer_;
-  std::vector<uint8_t> frame_buffer_;
-
-  // TX state
-  uint8_t next_tx_seq_;
-  bool tx_in_flight_;
-  uint8_t tx_inflight_seq_;
-  uint8_t tx_inflight_bytes_left_;
-  std::vector<uint8_t> tx_inflight_payload_;
-
-  // RX ACK state
-  std::optional<uint8_t> last_rx_seq_;
+  std::shared_ptr<SharedMacState> mac_state_;
 
   bool tunnel_logs_enabled_;
   const int irq_pin_;

@@ -289,6 +289,71 @@ uint64_t HashPacketFlow(const std::vector<uint8_t>& packet) {
   return hash;
 }
 
+enum class PacketClass {
+  Bulk,
+  Control,
+};
+
+struct PacketTraits {
+  PacketClass packet_class = PacketClass::Control;
+  bool is_udp = false;
+  bool is_tcp = false;
+  size_t packet_size = 0;
+};
+
+PacketTraits ClassifyPacket(const std::vector<uint8_t>& packet) {
+  PacketTraits traits;
+  traits.packet_size = packet.size();
+  if (packet.empty()) {
+    return traits;
+  }
+
+  const uint8_t version = static_cast<uint8_t>(packet[0] >> 4);
+  uint8_t protocol = 0;
+  size_t transport_offset = 0;
+
+  if (version == 4 && packet.size() >= 20) {
+    const size_t ihl = static_cast<size_t>(packet[0] & 0x0F) * 4;
+    if (ihl >= 20 && packet.size() >= ihl) {
+      protocol = packet[9];
+      transport_offset = ihl;
+    }
+  } else if (version == 6 && packet.size() >= 40) {
+    protocol = packet[6];
+    transport_offset = 40;
+  }
+
+  traits.is_udp = (protocol == 17);
+  traits.is_tcp = (protocol == 6);
+
+  const bool large_packet = packet.size() >= 192;
+  const bool large_udp = traits.is_udp && packet.size() >= 128;
+  const bool video_like_udp = traits.is_udp && packet.size() >= 96 && transport_offset != 0;
+
+  if (large_packet || large_udp || video_like_udp) {
+    traits.packet_class = PacketClass::Bulk;
+  }
+  return traits;
+}
+
+size_t ChooseRoleSeparatedRadioIndex(const std::vector<uint8_t>& packet,
+                                     const PacketTraits& traits,
+                                     size_t interface_count) {
+  if (interface_count <= 1) {
+    return 0;
+  }
+
+  const uint64_t hash_index = HashPacketFlow(packet) % interface_count;
+
+  // Keep the old flow-affinity baseline as the default/fallback.
+  // We only steer small control-like packets toward radio1 when dual-radio is active.
+  if (interface_count >= 2 && traits.packet_class == PacketClass::Control) {
+    return 1;
+  }
+
+  return static_cast<size_t>(hash_index);
+}
+
 struct TunnelDispatcher {
   int tunnel_key_fd = -1;
   int read_fd = -1;
@@ -296,6 +361,11 @@ struct TunnelDispatcher {
   std::mutex mutex;
   std::vector<RadioInterface*> interfaces;
   std::thread thread;
+  uint64_t bulk_packets = 0;
+  uint64_t control_packets = 0;
+  uint64_t radio0_packets = 0;
+  uint64_t radio1_packets = 0;
+  uint64_t last_stat_print_us = 0;
 };
 
 std::mutex g_tunnel_dispatchers_mutex;
@@ -333,8 +403,34 @@ void TunnelDispatchLoop(const std::shared_ptr<TunnelDispatcher>& dispatcher) {
       continue;
     }
 
-    const size_t index = static_cast<size_t>(HashPacketFlow(packet) % dispatcher->interfaces.size());
+    const PacketTraits traits = ClassifyPacket(packet);
+    const size_t index = ChooseRoleSeparatedRadioIndex(packet, traits, dispatcher->interfaces.size());
+
+    if (traits.packet_class == PacketClass::Bulk) {
+      ++dispatcher->bulk_packets;
+    } else {
+      ++dispatcher->control_packets;
+    }
+    if (index == 0) {
+      ++dispatcher->radio0_packets;
+    } else if (index == 1) {
+      ++dispatcher->radio1_packets;
+    }
+
     dispatcher->interfaces[index]->EnqueueTunnelPacket(std::move(packet));
+
+    const uint64_t now_us = TimeNowUs();
+    if (dispatcher->last_stat_print_us == 0) {
+      dispatcher->last_stat_print_us = now_us;
+    } else if (now_us - dispatcher->last_stat_print_us >= 1000000) {
+      LOGI("[DISPATCH] tunnel_fd=%d bulk=%llu control=%llu radio0=%llu radio1=%llu",
+           dispatcher->tunnel_key_fd,
+           static_cast<unsigned long long>(dispatcher->bulk_packets),
+           static_cast<unsigned long long>(dispatcher->control_packets),
+           static_cast<unsigned long long>(dispatcher->radio0_packets),
+           static_cast<unsigned long long>(dispatcher->radio1_packets));
+      dispatcher->last_stat_print_us = now_us;
+    }
   }
 }
 
@@ -412,7 +508,8 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
                                uint32_t secondary_addr,
                                uint8_t channel,
                                const RadioConfig& radio_config,
-                               int irq_pin)
+                               int irq_pin,
+                               std::shared_ptr<SharedMacState> shared_mac_state)
     : radio_(ce_pin, csn_pin),
       ce_pin_(ce_pin),
       csn_pin_(csn_pin),
@@ -421,10 +518,7 @@ RadioInterface::RadioInterface(uint16_t ce_pin,
       secondary_addr_(secondary_addr),
       radio_config_(radio_config),
       running_(true),
-      next_tx_seq_(1),
-      tx_in_flight_(false),
-      tx_inflight_seq_(0),
-      tx_inflight_bytes_left_(0),
+      mac_state_(shared_mac_state ? std::move(shared_mac_state) : std::make_shared<SharedMacState>()),
       tunnel_logs_enabled_(false),
       irq_pin_(irq_pin),
       irq_chip_(nullptr),
@@ -647,24 +741,24 @@ RadioInterface::RequestResult RadioInterface::Receive(
 }
 
 size_t RadioInterface::GetReadBufferSize() {
-  std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-  return read_buffer_.size();
+  std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+  return mac_state_->read_buffer.size();
 }
 
 void RadioInterface::EnqueueTunnelPacket(std::vector<uint8_t> packet) {
   constexpr size_t kMaxBufferedFrames = 1024;
 
-  std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-  if (read_buffer_.size() >= kMaxBufferedFrames) {
+  std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+  if (mac_state_->read_buffer.size() >= kMaxBufferedFrames) {
     LOGE("Dropping tunnel packet because TX queue is full on ce=%u csn=%u", 
          static_cast<unsigned>(ce_pin_),
          static_cast<unsigned>(csn_pin_));
     return;
   }
 
-  read_buffer_.push_back(std::move(packet));
+  mac_state_->read_buffer.push_back(std::move(packet));
   if (tunnel_logs_enabled_) {
-    LOGI("Queued %zu bytes from shared tunnel dispatcher", read_buffer_.back().size());
+    LOGI("Queued %zu bytes from shared tunnel dispatcher", mac_state_->read_buffer.back().size());
   }
 }
 
@@ -673,13 +767,14 @@ size_t RadioInterface::GetTransferSize(const std::vector<uint8_t>& frame) {
 }
 
 uint8_t RadioInterface::PendingHintLocked() const {
-  return static_cast<uint8_t>(std::min<size_t>(read_buffer_.size(), 255));
+  const size_t queued = mac_state_->read_buffer.size() + mac_state_->tx_window.size();
+  return static_cast<uint8_t>(std::min<size_t>(queued, 255));
 }
 
 void RadioInterface::AdvanceTxSeq() {
-  ++next_tx_seq_;
-  if (next_tx_seq_ == 0 || next_tx_seq_ > kMaxSeq) {
-    next_tx_seq_ = 1;
+  ++mac_state_->next_tx_seq;
+  if (mac_state_->next_tx_seq == 0 || mac_state_->next_tx_seq > kMaxSeq) {
+    mac_state_->next_tx_seq = 1;
   }
 }
 
@@ -694,15 +789,16 @@ bool RadioInterface::IsExpectedRxSeq(uint8_t seq) const {
   if (seq == 0) {
     return false;
   }
-  if (!last_rx_seq_.has_value()) {
+  if (!mac_state_->last_rx_seq.has_value()) {
     return true;
   }
-  return seq == NextSeq(last_rx_seq_.value());
+  return seq == NextSeq(mac_state_->last_rx_seq.value());
 }
 
 void RadioInterface::ResetRxAssemblyLocked() {
-  frame_buffer_.clear();
-  last_rx_seq_.reset();
+  mac_state_->frame_buffer.clear();
+  mac_state_->last_rx_seq.reset();
+  mac_state_->rx_reorder_buffer.clear();
 }
 
 bool RadioInterface::EncodeMacFrame(const MacFrame& frame,
@@ -751,62 +847,103 @@ bool RadioInterface::DecodeMacFrame(const std::vector<uint8_t>& packet,
 }
 
 bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
+  constexpr size_t kBondTxWindowSize = 2;
+  constexpr uint64_t kBondRetransmitIntervalUs = 2000;
+
   frame = {};
   frame.type = FrameType::Data;
-  frame.ack = last_rx_seq_.value_or(kNoSeq);
+  frame.ack = mac_state_->last_rx_seq.value_or(kNoSeq);
   frame.pending = PendingHintLocked();
 
-  if (tx_in_flight_) {
-    frame.seq = tx_inflight_seq_;
-    frame.arg = tx_inflight_bytes_left_;
-    frame.payload = tx_inflight_payload_;
+  const uint64_t now_us = TimeNowUs();
+  if (!mac_state_->tx_window.empty()) {
+    auto& oldest = mac_state_->tx_window.front();
+    const bool window_full = mac_state_->tx_window.size() >= kBondTxWindowSize;
+    const bool retry_due = oldest.last_send_us == 0 ||
+        (now_us - oldest.last_send_us) >= kBondRetransmitIntervalUs;
+    if ((window_full || mac_state_->read_buffer.empty()) && retry_due) {
+      oldest.last_send_us = now_us;
+      ++oldest.send_count;
+      frame.seq = oldest.seq;
+      frame.arg = oldest.bytes_left;
+      frame.payload = oldest.payload;
+      return true;
+    }
+  }
+
+  if (mac_state_->tx_window.size() >= kBondTxWindowSize) {
+    if (mac_state_->tx_window.empty()) {
+      return false;
+    }
+    auto& oldest = mac_state_->tx_window.front();
+    oldest.last_send_us = now_us;
+    ++oldest.send_count;
+    frame.seq = oldest.seq;
+    frame.arg = oldest.bytes_left;
+    frame.payload = oldest.payload;
     return true;
   }
 
-  if (read_buffer_.empty()) {
-    return false;
+  if (mac_state_->read_buffer.empty()) {
+    if (mac_state_->tx_window.empty()) {
+      return false;
+    }
+    auto& oldest = mac_state_->tx_window.front();
+    oldest.last_send_us = now_us;
+    ++oldest.send_count;
+    frame.seq = oldest.seq;
+    frame.arg = oldest.bytes_left;
+    frame.payload = oldest.payload;
+    return true;
   }
 
-  auto& current = read_buffer_.front();
+  auto& current = mac_state_->read_buffer.front();
   const size_t transfer_size = GetTransferSize(current);
 
-  tx_in_flight_ = true;
-  tx_inflight_seq_ = next_tx_seq_;
-  tx_inflight_bytes_left_ =
-      static_cast<uint8_t>(std::min<size_t>(current.size(), 255));
-  tx_inflight_payload_.assign(current.begin(), current.begin() + transfer_size);
+  TxFragmentState fragment;
+  fragment.seq = mac_state_->next_tx_seq;
+  fragment.bytes_left = static_cast<uint8_t>(std::min<size_t>(current.size(), 255));
+  fragment.payload.assign(current.begin(), current.begin() + transfer_size);
+  fragment.last_send_us = now_us;
+  fragment.send_count = 1;
 
-  frame.seq = tx_inflight_seq_;
-  frame.arg = tx_inflight_bytes_left_;
-  frame.payload = tx_inflight_payload_;
+  current.erase(current.begin(), current.begin() + transfer_size);
+  if (current.empty()) {
+    mac_state_->read_buffer.pop_front();
+  }
+
+  mac_state_->tx_window.push_back(fragment);
+  AdvanceTxSeq();
+
+  frame.seq = fragment.seq;
+  frame.arg = fragment.bytes_left;
+  frame.payload = fragment.payload;
   return true;
 }
 
 void RadioInterface::CommitAckLocked(uint8_t ack_seq) {
-  if (!tx_in_flight_) {
-    return;
-  }
-  if (ack_seq != tx_inflight_seq_) {
+  if (ack_seq == kNoSeq || mac_state_->tx_window.empty()) {
     return;
   }
 
-  if (!read_buffer_.empty()) {
-    auto& frame = read_buffer_.front();
-    const size_t consumed = std::min(frame.size(), tx_inflight_payload_.size());
-    frame.erase(frame.begin(), frame.begin() + consumed);
-    if (frame.empty()) {
-      read_buffer_.pop_front();
+  auto ack_it = mac_state_->tx_window.end();
+  for (auto it = mac_state_->tx_window.begin(); it != mac_state_->tx_window.end(); ++it) {
+    if (it->seq == ack_seq) {
+      ack_it = it;
+      break;
     }
   }
 
-  tx_in_flight_ = false;
-  tx_inflight_seq_ = 0;
-  tx_inflight_bytes_left_ = 0;
-  tx_inflight_payload_.clear();
-  AdvanceTxSeq();
+  if (ack_it == mac_state_->tx_window.end()) {
+    return;
+  }
+
+  mac_state_->tx_window.erase(mac_state_->tx_window.begin(), std::next(ack_it));
 }
 
 bool RadioInterface::ConsumeDataFrameLocked(const MacFrame& frame) {
+  constexpr uint8_t kBondRxReorderWindow = 4;
+
   if (frame.type != FrameType::Data) {
     return true;
   }
@@ -817,35 +954,67 @@ bool RadioInterface::ConsumeDataFrameLocked(const MacFrame& frame) {
     return false;
   }
 
-  if (last_rx_seq_.has_value()) {
-    const uint8_t last = last_rx_seq_.value();
-    const uint8_t expected = NextSeq(last);
-
-    if (frame.seq == last) {
-      // Duplicate retransmission. ACK만 다시 보내게 하고 payload는 다시 붙이지 않는다.
-      return true;
+  const auto seq_distance_forward = [this](uint8_t base, uint8_t seq) -> uint8_t {
+    if (seq == 0) {
+      return 0xFF;
     }
-
-    if (frame.seq != expected) {
-      LOGE("Received unexpected DATA seq=%u expected=%u last=%u",
-           frame.seq,
-           expected,
-           last);
-      ResetRxAssemblyLocked();
-      return false;
+    if (base == 0) {
+      return seq;
     }
+    if (seq == base) {
+      return 0;
+    }
+    if (seq > base) {
+      return static_cast<uint8_t>(seq - base);
+    }
+    return static_cast<uint8_t>(kMaxSeq - base + seq);
+  };
+
+  const uint8_t delivered_seq = mac_state_->last_rx_seq.value_or(0);
+  if (delivered_seq != 0 && frame.seq == delivered_seq) {
+    return true;
+  }
+  if (mac_state_->rx_reorder_buffer.find(frame.seq) != mac_state_->rx_reorder_buffer.end()) {
+    return true;
   }
 
-  last_rx_seq_ = frame.seq;
+  const uint8_t forward_distance = seq_distance_forward(delivered_seq, frame.seq);
+  const uint8_t reverse_distance = delivered_seq == 0 ? 0xFF : seq_distance_forward(frame.seq, delivered_seq);
 
-  if (!frame.payload.empty()) {
-    frame_buffer_.insert(frame_buffer_.end(),
-                         frame.payload.begin(),
-                         frame.payload.end());
+  if (delivered_seq != 0 && reverse_distance < forward_distance) {
+    return true;
+  }
 
-    if (frame.arg <= kMaxPayloadSize) {
-      WriteTunnel();
+  if (forward_distance == 0 || forward_distance > kBondRxReorderWindow) {
+    LOGE("Received DATA seq=%u outside reorder window (last=%u dist=%u)",
+         frame.seq,
+         delivered_seq,
+         forward_distance);
+    return false;
+  }
+
+  mac_state_->rx_reorder_buffer.emplace(
+      frame.seq,
+      RxFragmentState{frame.arg, frame.payload});
+
+  while (true) {
+    const uint8_t next_expected = NextSeq(mac_state_->last_rx_seq.value_or(0));
+    const auto it = mac_state_->rx_reorder_buffer.find(next_expected);
+    if (it == mac_state_->rx_reorder_buffer.end()) {
+      break;
     }
+
+    if (!it->second.payload.empty()) {
+      mac_state_->frame_buffer.insert(mac_state_->frame_buffer.end(),
+                           it->second.payload.begin(),
+                           it->second.payload.end());
+      if (it->second.bytes_left <= kMaxPayloadSize) {
+        WriteTunnel();
+      }
+    }
+
+    mac_state_->last_rx_seq = next_expected;
+    mac_state_->rx_reorder_buffer.erase(it);
   }
 
   return true;
@@ -894,19 +1063,19 @@ bool RadioInterface::IsValidIpPacket(const std::vector<uint8_t>& packet) const {
 
 void RadioInterface::WriteTunnel() {
   if (tunnel_logs_enabled_) {
-    LOGI("Writing %zu bytes to tunnel", frame_buffer_.size());
+    LOGI("Writing %zu bytes to tunnel", mac_state_->frame_buffer.size());
   }
 
-  if (!IsValidIpPacket(frame_buffer_)) {
-    LOGE("Dropping invalid reassembled IP packet len=%zu", frame_buffer_.size());
-    frame_buffer_.clear();
+  if (!IsValidIpPacket(mac_state_->frame_buffer)) {
+    LOGE("Dropping invalid reassembled IP packet len=%zu", mac_state_->frame_buffer.size());
+    mac_state_->frame_buffer.clear();
     return;
   }
 
   const int bytes_written =
-      write(tunnel_fd_, frame_buffer_.data(), frame_buffer_.size());
+      write(tunnel_fd_, mac_state_->frame_buffer.data(), mac_state_->frame_buffer.size());
 
-  frame_buffer_.clear();
+  mac_state_->frame_buffer.clear();
 
   if (bytes_written < 0) {
     LOGE("Failed to write to tunnel %s (%d)", strerror(errno), errno);

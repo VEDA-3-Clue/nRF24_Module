@@ -22,6 +22,12 @@
 #include "nerfnet/util/log.h"
 #include "nerfnet/util/time.h"
 
+#define read_buffer_mutex_ mac_state_->read_buffer_mutex
+#define read_buffer_ mac_state_->read_buffer
+#define frame_buffer_ mac_state_->frame_buffer
+#define next_tx_seq_ mac_state_->next_tx_seq
+#define last_rx_seq_ mac_state_->last_rx_seq
+
 namespace nerfnet {
 
 PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
@@ -32,7 +38,8 @@ PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
                                              uint8_t channel,
                                              uint64_t poll_interval_us,
                                              const RadioConfig& radio_config,
-                                             int irq_pin)
+                                             int irq_pin,
+                                             std::shared_ptr<RadioInterface::SharedMacState> shared_mac_state)
     : RadioInterface(ce_pin,
                      csn_pin,
                      tunnel_fd,
@@ -40,7 +47,8 @@ PrimaryRadioInterface::PrimaryRadioInterface(uint16_t ce_pin,
                      secondary_addr,
                      channel,
                      radio_config,
-                     irq_pin),
+                     irq_pin,
+                     std::move(shared_mac_state)),
       poll_interval_us_(poll_interval_us),
       current_poll_interval_us_(poll_interval_us),
       poll_fail_count_(0),
@@ -162,10 +170,12 @@ void PrimaryRadioInterface::Run() {
     }
 
     if (stat_now_us - last_stat_print_us_ >= 1000000) {
+      const size_t tx_window_size = mac_state_->tx_window.size();
+      const size_t rx_reorder_size = mac_state_->rx_reorder_buffer.size();
       LOGI("[COORD][STAT] pend_tx=%llu grant_tx=%llu data_tx=%llu "
            "ack_rx=%llu pend_rx=%llu data_rx=%llu "
            "send_fail=%llu sf_pend=%llu sf_grant=%llu sf_data=%llu sf_ack=%llu sf_reset=%llu "
-           "rx_timeout=%llu disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
+           "rx_timeout=%llu tx_window=%zu rx_reorder=%zu disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
            static_cast<unsigned long long>(tx_pending_count_),
            static_cast<unsigned long long>(tx_grant_count_),
            static_cast<unsigned long long>(tx_data_count_),
@@ -179,6 +189,8 @@ void PrimaryRadioInterface::Run() {
            static_cast<unsigned long long>(tx_send_fail_ack_count_),
            static_cast<unsigned long long>(tx_send_fail_reset_count_),
            static_cast<unsigned long long>(rx_timeout_count_),
+           tx_window_size,
+           rx_reorder_size,
            disconnected_ ? 1u : 0u,
            poll_fail_count_,
            send_fail_streak_,
@@ -197,11 +209,9 @@ bool PrimaryRadioInterface::ConnectionReset() {
   {
     std::lock_guard<std::mutex> lock(read_buffer_mutex_);
     next_tx_seq_ = 1;
-    tx_in_flight_ = false;
-    tx_inflight_seq_ = 0;
-    tx_inflight_bytes_left_ = 0;
-    tx_inflight_payload_.clear();
+    mac_state_->tx_window.clear();
     last_rx_seq_.reset();
+    mac_state_->rx_reorder_buffer.clear();
     frame_buffer_.clear();
   }
 
@@ -254,7 +264,7 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
   bool local_has_data = false;
   {
     std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-    local_has_data = tx_in_flight_ || !read_buffer_.empty();
+    local_has_data = !mac_state_->tx_window.empty() || !read_buffer_.empty();
   }
 
   switch (state_) {

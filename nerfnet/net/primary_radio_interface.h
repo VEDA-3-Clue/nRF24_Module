@@ -20,6 +20,8 @@
 #include <algorithm>
 #include <cstdint>
 
+#include <memory>
+
 #include "nerfnet/net/radio_interface.h"
 
 namespace nerfnet {
@@ -34,7 +36,8 @@ public:
                         uint8_t channel,
                         uint64_t poll_interval_us,
                         const RadioConfig& radio_config,
-                        int irq_pin = -1);
+                        int irq_pin = -1,
+                        std::shared_ptr<RadioInterface::SharedMacState> shared_mac_state = nullptr);
 
   void Run();
 

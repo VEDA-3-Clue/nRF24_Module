@@ -17,6 +17,8 @@
 #ifndef NERFNET_NET_SECONDARY_RADIO_INTERFACE_H_
 #define NERFNET_NET_SECONDARY_RADIO_INTERFACE_H_
 
+#include <memory>
+
 #include "nerfnet/net/radio_interface.h"
 
 namespace nerfnet {
@@ -30,7 +32,8 @@ class SecondaryRadioInterface : public RadioInterface {
                           uint32_t secondary_addr,
                           uint8_t channel,
                           const RadioConfig& radio_config,
-                          int irq_pin = -1);
+                          int irq_pin = -1,
+                        std::shared_ptr<RadioInterface::SharedMacState> shared_mac_state = nullptr);
 
   void Run();
 

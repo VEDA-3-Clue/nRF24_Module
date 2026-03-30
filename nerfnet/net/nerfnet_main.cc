@@ -241,11 +241,13 @@ int main(int argc, char** argv) {
        tunnel_ip_mask.getValue().c_str());
 
   if (primary_arg.getValue()) {
+    auto shared_mac_state = dual_radio_enabled ?
+        std::make_shared<nerfnet::RadioInterface::SharedMacState>() : nullptr;
     auto radio_interface = std::make_unique<nerfnet::PrimaryRadioInterface>(
         ce_pin_arg.getValue(), csn_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
         channel, poll_interval_us_arg.getValue(), radio_config,
-        irq_pin_arg.getValue());
+        irq_pin_arg.getValue(), shared_mac_state);
     radio_interface->SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
 
     std::unique_ptr<nerfnet::PrimaryRadioInterface> radio2_interface;
@@ -256,7 +258,7 @@ int main(int argc, char** argv) {
           radio2_csn_pin_arg.getValue(), tunnel_fd,
           primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
           radio2_channel, poll_interval_us_arg.getValue(), radio_config,
-          radio2_irq_pin_arg.getValue());
+          radio2_irq_pin_arg.getValue(), shared_mac_state);
       radio2_interface->SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
       radio2_thread = std::thread([&radio2_interface]() {
         radio2_interface->Run();
@@ -275,10 +277,12 @@ int main(int argc, char** argv) {
       radio2_thread.join();
     }
   } else if (secondary_arg.getValue()) {
+    auto shared_mac_state = dual_radio_enabled ?
+        std::make_shared<nerfnet::RadioInterface::SharedMacState>() : nullptr;
     auto radio_interface = std::make_unique<nerfnet::SecondaryRadioInterface>(
         ce_pin_arg.getValue(), csn_pin_arg.getValue(), tunnel_fd,
         primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-        channel, radio_config, irq_pin_arg.getValue());
+        channel, radio_config, irq_pin_arg.getValue(), shared_mac_state);
     radio_interface->SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
 
     std::unique_ptr<nerfnet::SecondaryRadioInterface> radio2_interface;
@@ -288,7 +292,7 @@ int main(int argc, char** argv) {
           static_cast<uint16_t>(radio2_ce_pin_arg.getValue()),
           radio2_csn_pin_arg.getValue(), tunnel_fd,
           primary_addr_arg.getValue(), secondary_addr_arg.getValue(),
-          radio2_channel, radio_config, radio2_irq_pin_arg.getValue());
+          radio2_channel, radio_config, radio2_irq_pin_arg.getValue(), shared_mac_state);
       radio2_interface->SetTunnelLogsEnabled(enable_tunnel_logs_arg.getValue());
       radio2_thread = std::thread([&radio2_interface]() {
         radio2_interface->Run();
