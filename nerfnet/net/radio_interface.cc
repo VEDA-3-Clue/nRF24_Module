@@ -1109,8 +1109,19 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   const bool recovering_head = !mac_state_->tx_window.empty() &&
       (mac_state_->tx_window.front().send_count > 0 ||
        mac_state_->tx_window.front().duplicate_ack_count > 0);
+  const bool control_already_in_window =
+      std::any_of(mac_state_->tx_window.begin(),
+                  mac_state_->tx_window.end(),
+                  [](const TxFragmentState& fragment) {
+                    return fragment.is_control;
+                  });
   if (recovering_head) {
-    return false;
+    const bool allow_control_bypass =
+        has_control && !control_already_in_window &&
+        mac_state_->tx_window.front().is_control == false;
+    if (!allow_control_bypass) {
+      return false;
+    }
   }
 
   if ((!has_control && !has_bulk) || !CanCurrentLinkOriginateLocked(now_us)) {
