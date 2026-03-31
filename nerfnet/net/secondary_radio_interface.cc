@@ -80,6 +80,11 @@ void SecondaryRadioInterface::Run() {
       continue;
     }
 
+    if (rx.type == FrameType::Data) {
+      ++local_rx_data_count_;
+    } else {
+      ++local_rx_control_count_;
+    }
     RecordRx(rx);
 
     if (rx.type == FrameType::Reset) {
@@ -113,6 +118,11 @@ void SecondaryRadioInterface::Run() {
       LOGE("[PEER] send failed");
     }
 
+    if (tx.type == FrameType::Data) {
+      ++local_tx_data_count_;
+    } else {
+      ++local_tx_control_count_;
+    }
     RecordTx(tx);
 
     bool is_idle_pair =
@@ -143,10 +153,16 @@ void SecondaryRadioInterface::Run() {
           link1_score = mac_state_->link_states[1].score;
         }
       }
-      LOGI("[PEER][STAT] pend_tx=%llu data_tx=%llu ack_tx=%llu reset_tx=%llu "
+      LOGI("[PEER][STAT] radio=%zu local_tx_ctrl=%llu local_tx_data=%llu local_rx_ctrl=%llu local_rx_data=%llu "
+           "pend_tx=%llu data_tx=%llu ack_tx=%llu reset_tx=%llu "
            "grant_rx=%llu pend_rx=%llu ack_rx=%llu data_rx=%llu reset_rx=%llu "
            "send_fail=%llu sf_pend=%llu sf_grant=%llu sf_data=%llu sf_ack=%llu sf_reset=%llu "
            "tx_window=%zu rx_reorder=%zu link0_score=%d link1_score=%d",
+           link_index_,
+           static_cast<unsigned long long>(local_tx_control_count_),
+           static_cast<unsigned long long>(local_tx_data_count_),
+           static_cast<unsigned long long>(local_rx_control_count_),
+           static_cast<unsigned long long>(local_rx_data_count_),
            static_cast<unsigned long long>(tx_pending_count_),
            static_cast<unsigned long long>(tx_data_count_),
            static_cast<unsigned long long>(tx_ack_count_),
@@ -202,6 +218,11 @@ bool SecondaryRadioInterface::HandleReset() {
     RecordSendFailure(tx.type);
     return false;
   }
+  if (tx.type == FrameType::Data) {
+    ++local_tx_data_count_;
+  } else {
+    ++local_tx_control_count_;
+  }
   RecordTx(tx);
   return true;
 }
@@ -247,7 +268,7 @@ bool SecondaryRadioInterface::ChoosePeerResponse(MacFrame& tx) {
   bool local_has_data = false;
   {
     std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-    local_has_data = !mac_state_->tx_window.empty() || !read_buffer_.empty();
+    local_has_data = !mac_state_->tx_window.empty() || !read_buffer_.empty() || !mac_state_->control_read_buffer.empty();
   }
 
   tx.pending = local_has_data ? 1 : 0;

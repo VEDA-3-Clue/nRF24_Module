@@ -74,6 +74,10 @@ private:
   uint64_t rx_ack_count_ = 0;
   uint64_t rx_pending_count_ = 0;
   uint64_t rx_data_count_ = 0;
+  uint64_t local_tx_control_count_ = 0;
+  uint64_t local_tx_data_count_ = 0;
+  uint64_t local_rx_control_count_ = 0;
+  uint64_t local_rx_data_count_ = 0;
   uint64_t tx_send_fail_count_ = 0;
   uint64_t tx_send_fail_pending_count_ = 0;
   uint64_t tx_send_fail_grant_count_ = 0;

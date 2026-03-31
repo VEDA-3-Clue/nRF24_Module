@@ -796,23 +796,30 @@ RadioInterface::RequestResult RadioInterface::Receive(
 
 size_t RadioInterface::GetReadBufferSize() {
   std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
-  return mac_state_->read_buffer.size();
+  return mac_state_->read_buffer.size() + mac_state_->control_read_buffer.size();
 }
 
 void RadioInterface::EnqueueTunnelPacket(std::vector<uint8_t> packet) {
   constexpr size_t kMaxBufferedFrames = 1024;
 
+  const PacketTraits traits = ClassifyPacket(packet);
   std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
-  if (mac_state_->read_buffer.size() >= kMaxBufferedFrames) {
-    LOGE("Dropping tunnel packet because TX queue is full on ce=%u csn=%u", 
+  const size_t queued = mac_state_->read_buffer.size() + mac_state_->control_read_buffer.size();
+  if (queued >= kMaxBufferedFrames) {
+    LOGE("Dropping tunnel packet because TX queue is full on ce=%u csn=%u",
          static_cast<unsigned>(ce_pin_),
          static_cast<unsigned>(csn_pin_));
     return;
   }
 
-  mac_state_->read_buffer.push_back(std::move(packet));
+  auto& target_queue = (traits.packet_class == PacketClass::Control)
+      ? mac_state_->control_read_buffer
+      : mac_state_->read_buffer;
+  target_queue.push_back(std::move(packet));
   if (tunnel_logs_enabled_) {
-    LOGI("Queued %zu bytes from shared tunnel dispatcher", mac_state_->read_buffer.back().size());
+    LOGI("Queued %zu bytes from shared tunnel dispatcher (%s)",
+         target_queue.back().size(),
+         traits.packet_class == PacketClass::Control ? "control" : "bulk");
   }
 }
 
@@ -821,7 +828,9 @@ size_t RadioInterface::GetTransferSize(const std::vector<uint8_t>& frame) {
 }
 
 uint8_t RadioInterface::PendingHintLocked() const {
-  const size_t queued = mac_state_->read_buffer.size() + mac_state_->tx_window.size();
+  const size_t queued = mac_state_->read_buffer.size() +
+                        mac_state_->control_read_buffer.size() +
+                        mac_state_->tx_window.size();
   return static_cast<uint8_t>(std::min<size_t>(queued, 255));
 }
 
@@ -1031,11 +1040,14 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
     return false;
   }
 
-  if (mac_state_->read_buffer.empty() || !CanCurrentLinkOriginateLocked(now_us)) {
+  const bool has_control = !mac_state_->control_read_buffer.empty();
+  const bool has_bulk = !mac_state_->read_buffer.empty();
+  if ((!has_control && !has_bulk) || !CanCurrentLinkOriginateLocked(now_us)) {
     return false;
   }
 
-  auto& current = mac_state_->read_buffer.front();
+  auto& source_queue = has_control ? mac_state_->control_read_buffer : mac_state_->read_buffer;
+  auto& current = source_queue.front();
   const size_t transfer_size = GetTransferSize(current);
 
   TxFragmentState fragment;
@@ -1046,7 +1058,7 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
 
   current.erase(current.begin(), current.begin() + transfer_size);
   if (current.empty()) {
-    mac_state_->read_buffer.pop_front();
+    source_queue.pop_front();
   }
 
   mac_state_->tx_window.push_back(fragment);

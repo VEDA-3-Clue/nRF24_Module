@@ -57,6 +57,10 @@ class SecondaryRadioInterface : public RadioInterface {
   uint64_t tx_send_fail_ack_count_ = 0;
   uint64_t tx_send_fail_reset_count_ = 0;
   uint64_t last_stat_print_us_ = 0;
+  uint64_t local_tx_control_count_ = 0;
+  uint64_t local_tx_data_count_ = 0;
+  uint64_t local_rx_control_count_ = 0;
+  uint64_t local_rx_data_count_ = 0;
 
   bool HandleReset();
   bool ApplyCoordinatorRequest(const MacFrame& request);

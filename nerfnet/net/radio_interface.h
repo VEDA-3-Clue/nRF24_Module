@@ -78,6 +78,7 @@ class RadioInterface : public NonCopyable {
   struct SharedMacState {
     std::mutex read_buffer_mutex;
     std::deque<std::vector<uint8_t>> read_buffer;
+    std::deque<std::vector<uint8_t>> control_read_buffer;
     std::vector<uint8_t> frame_buffer;
     uint8_t next_tx_seq = 1;
     std::deque<TxFragmentState> tx_window;

@@ -185,10 +185,16 @@ void PrimaryRadioInterface::Run() {
           link1_score = mac_state_->link_states[1].score;
         }
       }
-      LOGI("[COORD][STAT] pend_tx=%llu grant_tx=%llu data_tx=%llu "
+      LOGI("[COORD][STAT] radio=%zu local_tx_ctrl=%llu local_tx_data=%llu local_rx_ctrl=%llu local_rx_data=%llu "
+           "pend_tx=%llu grant_tx=%llu data_tx=%llu "
            "ack_rx=%llu pend_rx=%llu data_rx=%llu "
            "send_fail=%llu sf_pend=%llu sf_grant=%llu sf_data=%llu sf_ack=%llu sf_reset=%llu "
            "rx_timeout=%llu tx_window=%zu rx_reorder=%zu link0_score=%d link1_score=%d disconnected=%u fail_streak=%d send_streak=%d timeout_streak=%d backoff_us=%llu",
+           link_index_,
+           static_cast<unsigned long long>(local_tx_control_count_),
+           static_cast<unsigned long long>(local_tx_data_count_),
+           static_cast<unsigned long long>(local_rx_control_count_),
+           static_cast<unsigned long long>(local_rx_data_count_),
            static_cast<unsigned long long>(tx_pending_count_),
            static_cast<unsigned long long>(tx_grant_count_),
            static_cast<unsigned long long>(tx_data_count_),
@@ -277,10 +283,12 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
   tx.ack = last_rx_seq_.value_or(kNoSeq);
 
   bool local_has_data = false;
+  bool local_has_priority_control = false;
   bool peer_rx_unsynced = false;
   {
     std::lock_guard<std::mutex> lock(read_buffer_mutex_);
-    local_has_data = !mac_state_->tx_window.empty() || !read_buffer_.empty();
+    local_has_data = !mac_state_->tx_window.empty() || !read_buffer_.empty() || !mac_state_->control_read_buffer.empty();
+    local_has_priority_control = !mac_state_->control_read_buffer.empty();
     peer_rx_unsynced = !last_rx_seq_.has_value() || !mac_state_->rx_reorder_buffer.empty();
   }
 
@@ -305,7 +313,9 @@ bool PrimaryRadioInterface::ChooseCoordinatorTxFrame(MacFrame& tx) {
 
     case CoordinatorState::Idle:
       if (local_has_data) {
-        if (peer_has_pending_ && consecutive_local_data_frames_ >= kFairDataBurstLimit) {
+        if (!local_has_priority_control &&
+            peer_has_pending_ &&
+            consecutive_local_data_frames_ >= kFairDataBurstLimit) {
           tx.type = FrameType::Grant;
           tx.pending = 1;
           tx.arg = grant_size;
@@ -445,6 +455,18 @@ PrimaryRadioInterface::ExchangeResult PrimaryRadioInterface::PerformExchange() {
         rx.arg,
         rx.payload.size(),
         static_cast<int>(state_));
+  }
+
+  if (rx.type == FrameType::Data) {
+    ++local_rx_data_count_;
+  } else {
+    ++local_rx_control_count_;
+  }
+
+  if (tx.type == FrameType::Data) {
+    ++local_tx_data_count_;
+  } else {
+    ++local_tx_control_count_;
   }
 
   const bool applied = ApplyPeerResponse(rx);
