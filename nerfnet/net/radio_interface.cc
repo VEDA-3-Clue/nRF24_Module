@@ -299,9 +299,14 @@ struct PacketTraits {
   bool is_udp = false;
   bool is_tcp = false;
   size_t packet_size = 0;
+  uint16_t src_port = 0;
+  uint16_t dst_port = 0;
 };
 
 PacketTraits ClassifyPacket(const std::vector<uint8_t>& packet) {
+  constexpr uint16_t kControlUdpPort = 50000;
+  constexpr uint16_t kVideoUdpPort = 50004;
+
   PacketTraits traits;
   traits.packet_size = packet.size();
   if (packet.empty()) {
@@ -325,6 +330,26 @@ PacketTraits ClassifyPacket(const std::vector<uint8_t>& packet) {
 
   traits.is_udp = (protocol == 17);
   traits.is_tcp = (protocol == 6);
+
+  if ((traits.is_udp || traits.is_tcp) && transport_offset != 0 && packet.size() >= transport_offset + 4) {
+    traits.src_port = static_cast<uint16_t>((static_cast<uint16_t>(packet[transport_offset]) << 8) |
+                                            static_cast<uint16_t>(packet[transport_offset + 1]));
+    traits.dst_port = static_cast<uint16_t>((static_cast<uint16_t>(packet[transport_offset + 2]) << 8) |
+                                            static_cast<uint16_t>(packet[transport_offset + 3]));
+  }
+
+  if (traits.is_udp) {
+    const bool is_control_port = traits.src_port == kControlUdpPort || traits.dst_port == kControlUdpPort;
+    const bool is_video_port = traits.src_port == kVideoUdpPort || traits.dst_port == kVideoUdpPort;
+    if (is_control_port) {
+      traits.packet_class = PacketClass::Control;
+      return traits;
+    }
+    if (is_video_port) {
+      traits.packet_class = PacketClass::Bulk;
+      return traits;
+    }
+  }
 
   const bool large_packet = packet.size() >= 192;
   const bool large_udp = traits.is_udp && packet.size() >= 128;
@@ -800,16 +825,44 @@ size_t RadioInterface::GetReadBufferSize() {
 }
 
 void RadioInterface::EnqueueTunnelPacket(std::vector<uint8_t> packet) {
-  constexpr size_t kMaxBufferedFrames = 1024;
+  constexpr uint16_t kControlUdpPort = 50000;
+  constexpr uint16_t kVideoUdpPort = 50004;
+  constexpr size_t kMaxBufferedFrames = 96;
+  constexpr size_t kMaxGenericControlFrames = 4;
+  constexpr size_t kMaxVideoBulkFrames = 8;
+  constexpr size_t kMaxGenericBulkFrames = 24;
 
   const PacketTraits traits = ClassifyPacket(packet);
   std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+
+  const bool is_control_port = traits.is_udp &&
+      (traits.src_port == kControlUdpPort || traits.dst_port == kControlUdpPort);
+  const bool is_video_port = traits.is_udp &&
+      (traits.src_port == kVideoUdpPort || traits.dst_port == kVideoUdpPort);
+
+  if (traits.packet_class == PacketClass::Control) {
+    if (is_control_port) {
+      // RC/drone control is latency-sensitive: only the newest command matters.
+      mac_state_->control_read_buffer.clear();
+    } else {
+      while (mac_state_->control_read_buffer.size() >= kMaxGenericControlFrames) {
+        mac_state_->control_read_buffer.pop_front();
+      }
+    }
+  } else {
+    const size_t max_bulk_frames = is_video_port ? kMaxVideoBulkFrames : kMaxGenericBulkFrames;
+    while (mac_state_->read_buffer.size() >= max_bulk_frames) {
+      mac_state_->read_buffer.pop_front();
+    }
+  }
+
   const size_t queued = mac_state_->read_buffer.size() + mac_state_->control_read_buffer.size();
   if (queued >= kMaxBufferedFrames) {
-    LOGE("Dropping tunnel packet because TX queue is full on ce=%u csn=%u",
-         static_cast<unsigned>(ce_pin_),
-         static_cast<unsigned>(csn_pin_));
-    return;
+    if (!mac_state_->read_buffer.empty()) {
+      mac_state_->read_buffer.pop_front();
+    } else if (!mac_state_->control_read_buffer.empty()) {
+      mac_state_->control_read_buffer.pop_front();
+    }
   }
 
   auto& target_queue = (traits.packet_class == PacketClass::Control)
@@ -817,9 +870,10 @@ void RadioInterface::EnqueueTunnelPacket(std::vector<uint8_t> packet) {
       : mac_state_->read_buffer;
   target_queue.push_back(std::move(packet));
   if (tunnel_logs_enabled_) {
-    LOGI("Queued %zu bytes from shared tunnel dispatcher (%s)",
+    LOGI("Queued %zu bytes from shared tunnel dispatcher (%s%s)",
          target_queue.back().size(),
-         traits.packet_class == PacketClass::Control ? "control" : "bulk");
+         traits.packet_class == PacketClass::Control ? "control" : "bulk",
+         is_control_port ? ":udp50000" : (is_video_port ? ":udp50004" : ""));
   }
 }
 
@@ -1010,9 +1064,28 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
 
   EnsureLinkStateLocked();
   const uint64_t now_us = TimeNowUs();
+  const bool has_control = !mac_state_->control_read_buffer.empty();
+  const bool has_bulk = !mac_state_->read_buffer.empty();
+
+  if (has_control) {
+    // Soft control preemption: keep a just-sent in-flight bulk fragment, but drop stale
+    // bulk retries so control can take over without forcing repeated MAC resyncs.
+    for (auto it = mac_state_->tx_window.begin(); it != mac_state_->tx_window.end();) {
+      const bool stale_bulk = !it->is_control && it->send_count > 0 &&
+          it->last_send_us != 0 && (now_us - it->last_send_us) >= kHeadRecoveryRetransmitIntervalUs;
+      if (stale_bulk) {
+        it = mac_state_->tx_window.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
 
   for (size_t i = 0; i < mac_state_->tx_window.size(); ++i) {
     auto& fragment = mac_state_->tx_window[i];
+    if (has_control && !fragment.is_control) {
+      continue;
+    }
     const uint64_t retransmit_interval_us =
         (i == 0 && fragment.send_count > 0) ? kHeadRecoveryRetransmitIntervalUs
                                             : kBondRetransmitIntervalUs;
@@ -1040,8 +1113,6 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
     return false;
   }
 
-  const bool has_control = !mac_state_->control_read_buffer.empty();
-  const bool has_bulk = !mac_state_->read_buffer.empty();
   if ((!has_control && !has_bulk) || !CanCurrentLinkOriginateLocked(now_us)) {
     return false;
   }
@@ -1055,6 +1126,7 @@ bool RadioInterface::BuildNextDataFrameLocked(MacFrame& frame) {
   fragment.bytes_left = static_cast<uint8_t>(std::min<size_t>(current.size(), 255));
   fragment.payload.assign(current.begin(), current.begin() + transfer_size);
   fragment.preferred_link = static_cast<uint8_t>(link_index_);
+  fragment.is_control = has_control;
 
   current.erase(current.begin(), current.begin() + transfer_size);
   if (current.empty()) {
@@ -1102,6 +1174,32 @@ void RadioInterface::CommitAckLocked(uint8_t ack_seq) {
   mac_state_->tx_window.erase(mac_state_->tx_window.begin(), std::next(ack_it));
   if (!mac_state_->tx_window.empty()) {
     mac_state_->tx_window.front().duplicate_ack_count = 0;
+  }
+}
+
+
+void RadioInterface::TrimQueuedPacketsForLowLatency(size_t max_control_frames,
+                                                  size_t max_bulk_frames,
+                                                  bool drop_control_fragments) {
+  std::lock_guard<std::mutex> lock(mac_state_->read_buffer_mutex);
+
+  while (mac_state_->control_read_buffer.size() > max_control_frames) {
+    mac_state_->control_read_buffer.pop_front();
+  }
+  while (mac_state_->read_buffer.size() > max_bulk_frames) {
+    mac_state_->read_buffer.pop_front();
+  }
+
+  if (!drop_control_fragments) {
+    return;
+  }
+
+  for (auto it = mac_state_->tx_window.begin(); it != mac_state_->tx_window.end();) {
+    if (it->is_control) {
+      it = mac_state_->tx_window.erase(it);
+    } else {
+      ++it;
+    }
   }
 }
 

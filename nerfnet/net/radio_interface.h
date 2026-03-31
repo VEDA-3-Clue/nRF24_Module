@@ -57,6 +57,7 @@ class RadioInterface : public NonCopyable {
     uint8_t preferred_link = 0xFF;
     uint8_t last_tx_link = 0xFF;
     uint8_t duplicate_ack_count = 0;
+    bool is_control = false;
   };
 
   struct LinkQualityState {
@@ -186,6 +187,9 @@ class RadioInterface : public NonCopyable {
   // TX fragment helpers. Caller must hold read_buffer_mutex_.
   bool BuildNextDataFrameLocked(MacFrame& frame);
   void CommitAckLocked(uint8_t ack_seq);
+  void TrimQueuedPacketsForLowLatency(size_t max_control_frames,
+                                      size_t max_bulk_frames,
+                                      bool drop_control_fragments);
 
   // RX DATA handling. Caller must hold read_buffer_mutex_.
   bool ConsumeDataFrameLocked(const MacFrame& frame);

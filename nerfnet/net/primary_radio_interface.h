@@ -65,6 +65,9 @@ private:
   static constexpr uint64_t kInitialDisconnectBackoffUs = 100000;   // 100 ms
   static constexpr uint64_t kMaxDisconnectBackoffUs = 1000000;      // 1 s
   static constexpr uint64_t kDisconnectedSleepSliceUs = 1000;       // 1 ms
+  static constexpr uint64_t kSoftRecoveryCooldownUs = 20000;         // 20 ms
+  static constexpr uint64_t kResetRecoveryCooldownUs = 150000;       // 150 ms
+  static constexpr uint64_t kResetMinIntervalUs = 300000;            // 300 ms
 
   uint8_t peer_grant_budget_;
 
@@ -96,6 +99,8 @@ private:
   uint64_t disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
   uint64_t next_retry_time_us_ = 0;
   uint64_t reset_fail_log_counter_ = 0;
+  uint64_t recovery_cooldown_until_us_ = 0;
+  uint64_t last_reset_success_us_ = 0;
 
   CoordinatorState state_;
   bool connection_reset_required_;
@@ -119,6 +124,7 @@ private:
   bool ConnectionReset();
   ExchangeResult PerformExchange();
   void HandleTransactionFailure(FailureType failure_type);
+  void SoftRecoverMacState();
 
   bool ChooseCoordinatorTxFrame(MacFrame& tx);
   bool ApplyPeerResponse(const MacFrame& rx);

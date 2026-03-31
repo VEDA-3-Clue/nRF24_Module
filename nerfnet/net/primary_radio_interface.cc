@@ -109,8 +109,15 @@ void PrimaryRadioInterface::Run() {
         timeout_fail_streak_ = 0;
         disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
         next_retry_time_us_ = 0;
+        last_reset_success_us_ = TimeNowUs();
+        recovery_cooldown_until_us_ = last_reset_success_us_ + kResetRecoveryCooldownUs;
         state_ = CoordinatorState::Idle;
       }
+      continue;
+    }
+
+    if (now_us < recovery_cooldown_until_us_) {
+      SleepUs(kDisconnectedSleepSliceUs);
       continue;
     }
 
@@ -140,6 +147,8 @@ void PrimaryRadioInterface::Run() {
         disconnected_ = false;
         disconnect_backoff_us_ = kInitialDisconnectBackoffUs;
         next_retry_time_us_ = 0;
+        last_reset_success_us_ = TimeNowUs();
+        recovery_cooldown_until_us_ = last_reset_success_us_ + kResetRecoveryCooldownUs;
       }
       continue;
     }
@@ -529,19 +538,36 @@ void PrimaryRadioInterface::HandleTransactionFailure(FailureType failure_type) {
       break;
   }
 
+  const uint64_t now_us = TimeNowUs();
   const int combined_fail_streak = send_fail_streak_ + timeout_fail_streak_;
   poll_fail_count_ = combined_fail_streak;
+  const bool recent_reset =
+      last_reset_success_us_ != 0 &&
+      (now_us - last_reset_success_us_) < kResetMinIntervalUs;
+
+  if (timeout_fail_streak_ >= 3 || combined_fail_streak >= 5) {
+    TrimQueuedPacketsForLowLatency(/*max_control_frames=*/2,
+                                   /*max_bulk_frames=*/8,
+                                   /*drop_control_fragments=*/true);
+    SoftRecoverMacState();
+    recovery_cooldown_until_us_ = std::max(recovery_cooldown_until_us_, now_us + kSoftRecoveryCooldownUs);
+  }
 
   const bool disconnect_now =
-      send_fail_streak_ >= kDisconnectFailureThreshold ||
-      timeout_fail_streak_ >= (kDisconnectFailureThreshold + 2) ||
-      combined_fail_streak >= (kDisconnectFailureThreshold + 3);
+      !recent_reset &&
+      (send_fail_streak_ >= kDisconnectFailureThreshold ||
+       timeout_fail_streak_ >= (kDisconnectFailureThreshold + 2) ||
+       combined_fail_streak >= (kDisconnectFailureThreshold + 3));
 
   if (disconnect_now) {
+    TrimQueuedPacketsForLowLatency(/*max_control_frames=*/1,
+                                   /*max_bulk_frames=*/0,
+                                   /*drop_control_fragments=*/true);
+    SoftRecoverMacState();
     disconnected_ = true;
     connection_reset_required_ = true;
     state_ = CoordinatorState::ResetSync;
-    next_retry_time_us_ = TimeNowUs() + disconnect_backoff_us_;
+    next_retry_time_us_ = now_us + disconnect_backoff_us_;
     return;
   }
 
@@ -549,6 +575,17 @@ void PrimaryRadioInterface::HandleTransactionFailure(FailureType failure_type) {
   if (current_poll_interval_us_ > 1000000) {
     current_poll_interval_us_ = 1000000;
   }
+}
+
+void PrimaryRadioInterface::SoftRecoverMacState() {
+  std::lock_guard<std::mutex> lock(read_buffer_mutex_);
+  mac_state_->tx_window.clear();
+  mac_state_->rx_reorder_buffer.clear();
+  frame_buffer_.clear();
+  last_rx_seq_.reset();
+  peer_grant_budget_ = 0;
+  last_tx_was_data_ = false;
+  consecutive_local_data_frames_ = 0;
 }
 
 }  // namespace nerfnet
